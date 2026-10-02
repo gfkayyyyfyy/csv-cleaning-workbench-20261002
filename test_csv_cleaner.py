@@ -20,7 +20,11 @@ The tests exercise only the documented public CLI:
   YYYY-MM-DD or DD/MM/YYYY (ASCII digits, zero-padded) normalize to
   YYYY-MM-DD, and the first invalid date (internal whitespace, unpadded
   numbers, time suffixes, NULL/N/A text, nonexistent calendar dates)
-  fails by CSV record number without exporting anything.
+  fails by CSV record number without exporting anything. A year-boundary
+  regression pins the documented 0001-9999 range: both endpoints convert
+  (the low year keeps four digits), 2000-02-29 is a century leap day in
+  either spelling, and 1900-02-29, 29/02/2100, 0000-01-01 and
+  01/01/10000 are each rejected at record 3 without partial output.
 * invalid inputs (zero-byte file, BOM-only file, empty and duplicate
   header column names, an unterminated quoted field, invalid UTF-8 bytes
   and a record with too many fields following a record containing a
@@ -129,6 +133,38 @@ INVALID_DATE_VALUES = [
     "２０２４-０３-０１",   # fullwidth digits are not ASCII digits
     "2024/03/01",        # slashes only in DD/MM/YYYY order
     "01-03-2024",        # dashes only in YYYY-MM-DD order
+]
+
+# Year-boundary and century-leap regression for the documented 0001-9999
+# range. The four date values hit: the lowest year (kept four digits on
+# export), the highest year, the year-2000 century leap day in the
+# DD/MM/YYYY spelling with one space on each side, and that same leap day
+# already spelled ISO (so it must not count as a change).
+BOUNDARY_DATE_ROWS = [
+    DATE_HEADER,
+    ["01/01/0001", 'he said "hi, all"\nline two'],  # year 0001 endpoint
+    ["9999-12-31", "a,b,c"],                        # year 9999 endpoint
+    [" 29/02/2000 ", 'quote "x", comma and\nwrap'],  # century leap day
+    ["2000-02-29", "plain"],                        # already normalized
+]
+BOUNDARY_EXPECTED_DATES = [
+    "0001-01-01",
+    "9999-12-31",
+    "2000-02-29",
+    "2000-02-29",
+]
+# Only rows 1 and 3 change; the two ISO values were already normalized.
+BOUNDARY_EXPECTED_CHANGED = 2
+
+# Out-of-range and non-leap century cases. Each run puts one cleanable
+# record first (its note holds a real newline), the candidate value at
+# record 3, and a second invalid date 31/04/2000 at record 4 which must
+# never be reported: the first failure aborts the run.
+BOUNDARY_INVALID_VALUES = [
+    "1900-02-29",   # 1900 is divisible by 100 but not 400: not a leap year
+    "29/02/2100",   # 2100 is likewise not a leap year
+    "0000-01-01",   # year 0000 is one below the documented range
+    "01/01/10000",  # a five-digit year is one above the documented range
 ]
 
 
@@ -468,6 +504,111 @@ class CsvCleanerCliTests(unittest.TestCase):
                 self.assertNotIn("Traceback", stderr_text)
                 self.assertFalse(output_path.exists())
                 self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_year_boundaries_and_century_leap_day(self):
+        # Acceptance for the README's 0001-9999 range claim: both year
+        # endpoints convert, the year-0001 value keeps four digits, and
+        # 2000-02-29 (divisible by 400) is a leap day in either spelling.
+        # The last value is already ISO and must not count as a change.
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "date_boundary_bom" if bom else "date_boundary_nobom"
+                input_path, original_bytes = self.write_input(
+                    BOUNDARY_DATE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing non-whitespace.
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 4,
+                     "changed_cells": BOUNDARY_EXPECTED_CHANGED},
+                )
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                # The export is always BOM-free UTF-8, even for BOM input.
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+
+                output_rows = self.read_output_records(output_path)
+                # Header and record order are unchanged.
+                self.assertEqual(output_rows[0], DATE_HEADER)
+                self.assertEqual(len(output_rows), 5)
+                # Dates normalize to the expected spellings; year 0001
+                # keeps its leading zeroes through the ISO format.
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    BOUNDARY_EXPECTED_DATES,
+                )
+                # The note column is never cleaned. Parsed field values
+                # must preserve commas, double quotes and the embedded
+                # real newlines exactly.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in BOUNDARY_DATE_ROWS],
+                )
+
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_rejects_outside_range_and_non_leap_centuries(
+        self
+    ):
+        # 1900 and 2100 are divisible by 100 but not 400, so their
+        # February has no 29th; year 0000 and a five-digit year fall
+        # outside the documented 0001-9999 range. Each candidate sits at
+        # record 3 after one cleanable record and before 31/04/2000, so
+        # the first-error-only behavior is checked as well.
+        for value in BOUNDARY_INVALID_VALUES:
+            with self.subTest(value=value):
+                tag = (
+                    "date_boundary_bad_"
+                    + str(BOUNDARY_INVALID_VALUES.index(value))
+                )
+                rows = [
+                    DATE_HEADER,
+                    [" 29/02/2000 ", MULTILINE_NOTE],
+                    [value, "candidate"],
+                    ["31/04/2000", "never reported"],
+                ]
+                input_path, original_bytes = self.write_input(
+                    rows, bom=False, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 3", stderr_text)
+                # The message quotes the first offending value verbatim.
+                self.assertIn(value, stderr_text)
+                # Only the first invalid date is reported; the later
+                # 31/04/2000 record must not appear in the message.
+                self.assertNotIn("record 4", stderr_text)
+                self.assertNotIn("31/04/2000", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                # The cleanable record 2 must not have been exported.
+                self.assertFalse(output_path.exists())
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
 
     def assert_invalid_input_fails(self, input_path, output_path,
                                    original_bytes, fragments):
