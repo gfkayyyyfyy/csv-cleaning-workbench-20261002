@@ -16,6 +16,11 @@ The tests exercise only the documented public CLI:
   str.strip() trimming at both ends) become empty strings; near-miss text
   is preserved verbatim including surrounding and internal whitespace.
   Also covers the header-only summary and case-sensitive column lookup.
+* normalize-date: blank cells become empty, real Gregorian dates spelled
+  YYYY-MM-DD or DD/MM/YYYY (ASCII digits, zero-padded) normalize to
+  YYYY-MM-DD, and the first invalid date (internal whitespace, unpadded
+  numbers, time suffixes, NULL/N/A text, nonexistent calendar dates)
+  fails by CSV record number without exporting anything.
 * invalid inputs (zero-byte file, BOM-only file, empty and duplicate
   header column names, an unterminated quoted field, invalid UTF-8 bytes
   and a record with too many fields following a record containing a
@@ -95,6 +100,36 @@ NULL_EXPECTED_NAMES = [
 ]
 # Rows 2, 3, 4 and 10 actually change; row 1 was already empty.
 NULL_EXPECTED_CHANGED = 4
+
+# normalize-date sample: the due_date column exercises both accepted
+# spellings plus blank cells; the note column carries the quoting hazards
+# (commas, double quotes, a real newline) and must round-trip untouched.
+DATE_HEADER = ["due_date", "note"]
+DATE_ROWS = [
+    DATE_HEADER,
+    [" 29/02/2024 ", "first, with comma"],       # DD/MM/YYYY, padded ends
+    ["2024-03-01", '他说"好"\n第二行'],            # already ISO, quoted note
+    ["   ", "plain"],                            # whitespace-only -> empty
+    ["", "last"],                                # already empty: not a change
+]
+DATE_EXPECTED_DATES = ["2024-02-29", "2024-03-01", "", ""]
+# Rows 1 and 3 change; row 2 was already ISO and row 4 already empty.
+DATE_EXPECTED_CHANGED = 2
+
+# Cell values that must all be rejected as invalid dates.
+INVALID_DATE_VALUES = [
+    "31/02/2024",        # February never has 31 days
+    "29/02/2023",        # 2023 is not a leap year
+    "0000-01-01",        # year 0000 is outside 0001-9999
+    "2024-3-1",          # unpadded month and day
+    "2024-03-01 10:30",  # time suffix
+    "2024 -03-01",       # internal whitespace
+    "NULL",              # null marker text is not a date
+    "N/A",
+    "２０２４-０３-０１",   # fullwidth digits are not ASCII digits
+    "2024/03/01",        # slashes only in DD/MM/YYYY order
+    "01-03-2024",        # dashes only in YYYY-MM-DD order
+]
 
 
 def encode_csv(rows, *, bom):
@@ -299,6 +334,141 @@ class CsvCleanerCliTests(unittest.TestCase):
         self.assertFalse(output_path.exists())
         self.assertEqual(input_path.read_bytes(), original_bytes)
 
+    def test_normalize_date_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "date_bom" if bom else "date_nobom"
+                input_path, original_bytes = self.write_input(
+                    DATE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and nothing
+                # else; json.loads rejects trailing non-whitespace.
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(
+                    summary,
+                    {"rows": 4, "changed_cells": DATE_EXPECTED_CHANGED},
+                )
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+
+                output_rows = self.read_output_records(output_path)
+                # Header and record order are unchanged.
+                self.assertEqual(output_rows[0], DATE_HEADER)
+                self.assertEqual(len(output_rows), 5)
+                # The due_date column is normalized per row.
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    DATE_EXPECTED_DATES,
+                )
+                # The note column is never cleaned, so commas, double
+                # quotes and the embedded newline round-trip byte-for-byte
+                # in terms of parsed values.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in DATE_ROWS],
+                )
+
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_header_only_file_exports_header(self):
+        input_path, original_bytes = self.write_input(
+            [DATE_HEADER], bom=False, tag="date_header_only"
+        )
+        output_path = self.tmpdir / "cleaned_date_header_only.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 0, "changed_cells": 0},
+        )
+        self.assertTrue(output_path.exists())
+        self.assertFalse(
+            output_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+        self.assertEqual(
+            self.read_output_records(output_path), [DATE_HEADER]
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_first_invalid_value_fails_by_record_number(self):
+        # Record 2's note contains a quoted real newline, so it spans two
+        # physical lines but counts as one CSV record. Record 3 carries
+        # the impossible date 31/02/2024; it must be reported as record 3
+        # and the cleanable record 2 must not be exported ahead of it.
+        rows = [
+            DATE_HEADER,
+            [" 29/02/2024 ", MULTILINE_NOTE],
+            ["31/02/2024", "bad date"],
+            ["2024-03-01", "ok"],
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag="date_invalid"
+        )
+        output_path = self.tmpdir / "cleaned_date_invalid.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        self.assertIn("invalid date", stderr_text)
+        self.assertIn("due_date", stderr_text)
+        self.assertIn("record 3", stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_rejects_each_invalid_spelling(self):
+        # Every documented invalid spelling fails the run when it appears
+        # as the first data record (CSV record 2).
+        for value in INVALID_DATE_VALUES:
+            with self.subTest(value=value):
+                tag = f"date_bad_{INVALID_DATE_VALUES.index(value)}"
+                input_path, original_bytes = self.write_input(
+                    [DATE_HEADER, [value, "note"]], bom=False, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 2", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
     def assert_invalid_input_fails(self, input_path, output_path,
                                    original_bytes, fragments):
         """Run one invalid-input case and assert the documented failure.
@@ -468,6 +638,8 @@ class OutputPathProtectionTests(unittest.TestCase):
         # rule must change, so a successful run would have work to do.
         if rule == "trim":
             return [HEADER, [" Alice ", "x,y"]]
+        if rule == "normalize-date":
+            return [HEADER, [" 29/02/2024 ", "x,y"]]
         return [HEADER, [" n/A ", "x,y"]]
 
     def write_cleanable_input(self, workspace, rule):
@@ -512,7 +684,7 @@ class OutputPathProtectionTests(unittest.TestCase):
             "valid_csv": encode_csv([HEADER, ["keep", "me"]], bom=False),
             "non_utf8_bytes": b"\xff\xfe not valid utf-8",
         }
-        for rule in ("trim", "normalize-null"):
+        for rule in ("trim", "normalize-null", "normalize-date"):
             for target_kind, target_bytes in targets.items():
                 with self.subTest(rule=rule, target=target_kind):
                     workspace = self.make_workspace()
@@ -536,7 +708,7 @@ class OutputPathProtectionTests(unittest.TestCase):
                     self.assertEqual(input_path.read_bytes(), input_bytes)
 
     def test_output_path_identical_to_input_is_rejected(self):
-        for rule in ("trim", "normalize-null"):
+        for rule in ("trim", "normalize-null", "normalize-date"):
             with self.subTest(rule=rule):
                 workspace = self.make_workspace()
                 input_path, input_bytes = self.write_cleanable_input(
@@ -555,7 +727,7 @@ class OutputPathProtectionTests(unittest.TestCase):
                 self.assertEqual(input_path.read_bytes(), input_bytes)
 
     def test_output_path_with_dot_segment_aliasing_input_is_rejected(self):
-        for rule in ("trim", "normalize-null"):
+        for rule in ("trim", "normalize-null", "normalize-date"):
             with self.subTest(rule=rule):
                 workspace = self.make_workspace()
                 input_path, input_bytes = self.write_cleanable_input(
