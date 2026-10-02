@@ -1,7 +1,7 @@
 value,note
-NULL,plain text
- n/a ,"text, with comma"
-   ,"text with ""quotes"""
+,plain text
+,"text, with comma"
+,"text with ""quotes"""
 ,"line one
 line two"
  Alice ,another plain note

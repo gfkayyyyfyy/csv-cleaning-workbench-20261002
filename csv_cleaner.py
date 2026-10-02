@@ -17,8 +17,24 @@ import json
 import os
 import sys
 
+NULL_MARKERS = frozenset({"null", "n/a"})
+
+
+def normalize_null(value):
+    """Map empty or NULL/N/A markers (ASCII case-insensitive) to "".
+
+    Matching is done on the stripped value; a non-matching value is
+    returned unchanged, whitespace included.
+    """
+    stripped = value.strip()
+    if not stripped or stripped.lower() in NULL_MARKERS:
+        return ""
+    return value
+
+
 RULES = {
     "trim": str.strip,
+    "normalize-null": normalize_null,
 }
 
 
