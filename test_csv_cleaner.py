@@ -23,6 +23,12 @@ The tests exercise only the documented public CLI:
   reason on stderr without a Python traceback; no output file is left
   behind, even when an earlier record could already have been cleaned,
   and the input bytes stay untouched.
+* output path protection: an output path naming an existing regular
+  file (valid CSV or non-UTF-8 bytes), or resolving to the input file
+  itself (identical spelling or via a "." path segment), is rejected
+  with exit code 2, empty stdout and the documented reason on stderr;
+  the existing target and the input keep their exact bytes and no extra
+  files appear. A fresh output path still exports successfully.
 """
 
 import codecs
@@ -440,6 +446,168 @@ class CsvCleanerCliTests(unittest.TestCase):
             result.stderr.decode("utf-8"),
             "error: record 3 has 3 field(s), expected 2\n",
         )
+
+
+class OutputPathProtectionTests(unittest.TestCase):
+    """Output-path protection: existing files and same-path outputs.
+
+    Each scenario runs in its own temporary directory with a valid input
+    CSV whose named column exists and holds at least one cleanable value,
+    so no input-side validation can fail first and mask the path checks.
+    """
+
+    def make_workspace(self):
+        """Return a fresh temporary directory dedicated to one scenario."""
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        return Path(tempdir.name)
+
+    @staticmethod
+    def cleanable_rows(rule):
+        # A valid header plus one data record whose name cell the given
+        # rule must change, so a successful run would have work to do.
+        if rule == "trim":
+            return [HEADER, [" Alice ", "x,y"]]
+        return [HEADER, [" n/A ", "x,y"]]
+
+    def write_cleanable_input(self, workspace, rule):
+        input_bytes = encode_csv(self.cleanable_rows(rule), bom=False)
+        input_path = workspace / "input.csv"
+        input_path.write_bytes(input_bytes)
+        return input_path, input_bytes
+
+    def run_cleaner(self, input_path, output_path, *, rule, cwd):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--column", "name",
+                "--rule", rule,
+            ],
+            cwd=str(cwd),
+            capture_output=True,
+        )
+
+    def assert_refused(self, result, workspace, expected_files, fragment):
+        """Assert the documented refusal shape for one rejected run."""
+        self.assertEqual(result.returncode, 2)
+        # Empty stdout also means no success summary was printed.
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
+        self.assertIn(fragment, stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+        # No extra cleaned files may be left behind in the workspace.
+        self.assertEqual(
+            sorted(p.name for p in workspace.iterdir()),
+            sorted(expected_files),
+        )
+
+    def test_existing_output_file_is_never_overwritten(self):
+        # The pre-existing target is either a valid CSV file or a file
+        # holding non-UTF-8 bytes; neither may be read into, truncated or
+        # replaced, for either cleaning rule.
+        targets = {
+            "valid_csv": encode_csv([HEADER, ["keep", "me"]], bom=False),
+            "non_utf8_bytes": b"\xff\xfe not valid utf-8",
+        }
+        for rule in ("trim", "normalize-null"):
+            for target_kind, target_bytes in targets.items():
+                with self.subTest(rule=rule, target=target_kind):
+                    workspace = self.make_workspace()
+                    input_path, input_bytes = self.write_cleanable_input(
+                        workspace, rule
+                    )
+                    output_path = workspace / "cleaned.csv"
+                    output_path.write_bytes(target_bytes)
+
+                    result = self.run_cleaner(
+                        input_path, output_path, rule=rule, cwd=workspace
+                    )
+
+                    self.assert_refused(
+                        result, workspace,
+                        ["cleaned.csv", "input.csv"],
+                        "output file already exists",
+                    )
+                    # Target and input survive byte-for-byte.
+                    self.assertEqual(output_path.read_bytes(), target_bytes)
+                    self.assertEqual(input_path.read_bytes(), input_bytes)
+
+    def test_output_path_identical_to_input_is_rejected(self):
+        for rule in ("trim", "normalize-null"):
+            with self.subTest(rule=rule):
+                workspace = self.make_workspace()
+                input_path, input_bytes = self.write_cleanable_input(
+                    workspace, rule
+                )
+
+                result = self.run_cleaner(
+                    input_path, input_path, rule=rule, cwd=workspace
+                )
+
+                self.assert_refused(
+                    result, workspace, ["input.csv"],
+                    "output path must be different from the input path",
+                )
+                # The input is neither deleted nor rewritten.
+                self.assertEqual(input_path.read_bytes(), input_bytes)
+
+    def test_output_path_with_dot_segment_aliasing_input_is_rejected(self):
+        for rule in ("trim", "normalize-null"):
+            with self.subTest(rule=rule):
+                workspace = self.make_workspace()
+                input_path, input_bytes = self.write_cleanable_input(
+                    workspace, rule
+                )
+                # A different spelling containing a "." segment that still
+                # resolves to the input file (os.path.join keeps the dot,
+                # unlike pathlib).
+                aliased_output = os.path.join(
+                    str(workspace), ".", input_path.name
+                )
+                self.assertNotEqual(aliased_output, str(input_path))
+
+                result = self.run_cleaner(
+                    input_path, aliased_output, rule=rule, cwd=workspace
+                )
+
+                self.assert_refused(
+                    result, workspace, ["input.csv"],
+                    "output path must be different from the input path",
+                )
+                self.assertEqual(input_path.read_bytes(), input_bytes)
+
+    def test_fresh_output_path_exports_cleaned_csv(self):
+        # Control case: the same cleanable input exports successfully when
+        # the output path does not exist yet.
+        workspace = self.make_workspace()
+        input_path, input_bytes = self.write_cleanable_input(
+            workspace, "trim"
+        )
+        output_path = workspace / "cleaned.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path, rule="trim", cwd=workspace
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        # stdout is exactly one JSON object; key order is not fixed.
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 1, "changed_cells": 1},
+        )
+        raw_output = output_path.read_bytes()
+        self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+        with open(output_path, "r", encoding="utf-8", newline="") as outfile:
+            self.assertEqual(
+                list(csv.reader(outfile)),
+                [HEADER, ["Alice", "x,y"]],
+            )
+        self.assertEqual(input_path.read_bytes(), input_bytes)
 
 
 if __name__ == "__main__":
