@@ -16,6 +16,13 @@ The tests exercise only the documented public CLI:
   str.strip() trimming at both ends) become empty strings; near-miss text
   is preserved verbatim including surrounding and internal whitespace.
   Also covers the header-only summary and case-sensitive column lookup.
+* invalid inputs (zero-byte file, BOM-only file, empty and duplicate
+  header column names, an unterminated quoted field, invalid UTF-8 bytes
+  and a record with too many fields following a record containing a
+  quoted newline) fail with exit code 2, empty stdout and a categorized
+  reason on stderr without a Python traceback; no output file is left
+  behind, even when an earlier record could already have been cleaned,
+  and the input bytes stay untouched.
 """
 
 import codecs
@@ -100,6 +107,12 @@ class CsvCleanerCliTests(unittest.TestCase):
 
     def write_input(self, rows, *, bom, tag):
         data = encode_csv(rows, bom=bom)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def write_raw_input(self, data, *, tag):
+        """Write arbitrary raw bytes as an input file and report its path."""
         path = self.tmpdir / f"input_{tag}.csv"
         path.write_bytes(data)
         return path, data
@@ -279,6 +292,154 @@ class CsvCleanerCliTests(unittest.TestCase):
         self.assertIn("Name", stderr_text)
         self.assertFalse(output_path.exists())
         self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def assert_invalid_input_fails(self, input_path, output_path,
+                                   original_bytes, fragments):
+        """Run one invalid-input case and assert the documented failure.
+
+        Exit code 2, empty stdout, each given reason fragment on stderr,
+        no Python traceback, no output file left behind, and input bytes
+        unchanged. Returns the completed process for extra assertions.
+        """
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
+        for fragment in fragments:
+            self.assertIn(fragment, stderr_text)
+        # The failure must come through the documented error path: no
+        # interpreter traceback or an uncaught exception type line.
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertNotIn("Error:", stderr_text)
+        # Validation/parsing happens before anything is exported, so a
+        # failure must never leave a partially cleaned file behind...
+        self.assertFalse(
+            output_path.exists(),
+            "a failed run must not leave an output file behind",
+        )
+        # ...and the input file is opened read-only, so its exact bytes
+        # remain unchanged.
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+        return result
+
+    def test_zero_byte_file_reports_missing_header(self):
+        input_path, original_bytes = self.write_raw_input(
+            b"", tag="zero_byte"
+        )
+        output_path = self.tmpdir / "cleaned_zero_byte.csv"
+        self.assertFalse(output_path.exists())
+
+        self.assert_invalid_input_fails(
+            input_path, output_path, original_bytes,
+            ["input is empty", "no header"],
+        )
+
+    def test_bom_only_file_reports_missing_header(self):
+        # A file containing only the UTF-8 BOM has no records once the BOM
+        # is stripped, so it must be reported as having no header rather
+        # than crashing or exporting anything.
+        input_path, original_bytes = self.write_raw_input(
+            codecs.BOM_UTF8, tag="bom_only"
+        )
+        output_path = self.tmpdir / "cleaned_bom_only.csv"
+        self.assertFalse(output_path.exists())
+
+        self.assert_invalid_input_fails(
+            input_path, output_path, original_bytes,
+            ["input is empty", "no header"],
+        )
+
+    def test_header_with_empty_column_name_is_rejected(self):
+        input_path, original_bytes = self.write_raw_input(
+            b"name,\n", tag="empty_name"
+        )
+        output_path = self.tmpdir / "cleaned_empty_name.csv"
+        self.assertFalse(output_path.exists())
+
+        self.assert_invalid_input_fails(
+            input_path, output_path, original_bytes,
+            ["header contains an empty column name"],
+        )
+
+    def test_header_with_duplicate_column_names_is_rejected(self):
+        input_path, original_bytes = self.write_raw_input(
+            b"name,name\n", tag="duplicate_name"
+        )
+        output_path = self.tmpdir / "cleaned_duplicate_name.csv"
+        self.assertFalse(output_path.exists())
+
+        self.assert_invalid_input_fails(
+            input_path, output_path, original_bytes,
+            ["header contains duplicate column names"],
+        )
+
+    def test_unterminated_quoted_field_fails_without_partial_output(self):
+        # The first data record (" Alice ") would be cleanable; the second
+        # opens a quoted field that is still open at end of file. The parse
+        # failure must surface as exit code 2 and must not export the
+        # already-cleaned Alice record. Check both ways EOF can arrive:
+        # right inside the field, and after one more physical newline.
+        good_prefix = encode_csv(
+            [HEADER, [" Alice ", "ok"]], bom=False
+        )
+        for suffix, style in ((b"", "eof_inside_quotes"),
+                              (b"\n", "eof_after_newline")):
+            with self.subTest(style=style):
+                input_path, original_bytes = self.write_raw_input(
+                    good_prefix + b'Bob,"still quoting' + suffix,
+                    tag=f"unclosed_{style}",
+                )
+                output_path = self.tmpdir / f"cleaned_unclosed_{style}.csv"
+                self.assertFalse(output_path.exists())
+
+                self.assert_invalid_input_fails(
+                    input_path, output_path, original_bytes,
+                    ["cannot parse CSV", "unexpected end of data"],
+                )
+
+    def test_invalid_utf8_byte_fails_without_partial_output(self):
+        # A valid header and a cleanable first record, then a record
+        # carrying the invalid UTF-8 byte 0xFF. The decode failure must
+        # win and no cleaned version of the first record may be exported.
+        good_prefix = encode_csv(
+            [HEADER, [" Alice ", "ok"]], bom=False
+        )
+        input_path, original_bytes = self.write_raw_input(
+            good_prefix + b"Bob,\xff\n", tag="bad_utf8"
+        )
+        output_path = self.tmpdir / "cleaned_bad_utf8.csv"
+        self.assertFalse(output_path.exists())
+
+        self.assert_invalid_input_fails(
+            input_path, output_path, original_bytes,
+            ["not valid UTF-8", "0xff"],
+        )
+
+    def test_too_many_fields_after_quoted_newline_record(self):
+        # Record 2's note contains a quoted real newline, so it spans two
+        # physical lines but counts as one CSV record. Record 3 carries an
+        # extra field; it must be reported as record 3 with 3 fields
+        # (expected 2), the quoted newline must not be miscounted as a
+        # record boundary, and the cleanable Alice record in record 2
+        # must not be exported ahead of the failure.
+        data = encode_csv(
+            [HEADER, [" Alice ", MULTILINE_NOTE]], bom=False
+        ) + b"Bob,z,extra\n"
+        input_path, original_bytes = self.write_raw_input(
+            data, tag="extra_fields"
+        )
+        output_path = self.tmpdir / "cleaned_extra_fields.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.assert_invalid_input_fails(
+            input_path, output_path, original_bytes,
+            ["record 3", "3 field(s)", "expected 2"],
+        )
+        self.assertEqual(
+            result.stderr.decode("utf-8"),
+            "error: record 3 has 3 field(s), expected 2\n",
+        )
 
 
 if __name__ == "__main__":
