@@ -16,6 +16,15 @@ The tests exercise only the documented public CLI:
   str.strip() trimming at both ends) become empty strings; near-miss text
   is preserved verbatim including surrounding and internal whitespace.
   Also covers the header-only summary and case-sensitive column lookup.
+* normalize-date: padded DD/MM/YYYY and already-normalized YYYY-MM-DD
+  values are re-emitted as YYYY-MM-DD, empty and whitespace-only cells
+  become empty strings, and the note column (including a quoted newline)
+  is left untouched. A non-empty cell that is not an accepted real date
+  (impossible day, non-padded numbers, internal whitespace, time suffix,
+  NULL / N/A markers, fullwidth digits) fails with exit code 2, empty
+  stdout and an "invalid date" reason naming the column and the CSV
+  record number (quoted newlines do not advance it); no output file is
+  left behind and the input bytes stay untouched.
 * invalid inputs (zero-byte file, BOM-only file, empty and duplicate
   header column names, an unterminated quoted field, invalid UTF-8 bytes
   and a record with too many fields following a record containing a
@@ -95,6 +104,27 @@ NULL_EXPECTED_NAMES = [
 ]
 # Rows 2, 3, 4 and 10 actually change; row 1 was already empty.
 NULL_EXPECTED_CHANGED = 4
+
+DATE_HEADER = ["due_date", "note"]
+# normalize-date sample: a padded DD/MM/YYYY leap date, an already
+# normalized YYYY-MM-DD value (its note carries a quoted real newline so
+# record numbering is exercised), a whitespace-only cell and an empty
+# cell. Only the first and third rows change.
+DATE_ROWS = [
+    DATE_HEADER,
+    [" 29/02/2024 ", "ok"],
+    ["2024-03-01", MULTILINE_NOTE],
+    ["   ", "ok"],
+    ["", "ok"],
+]
+
+DATE_EXPECTED_DATES = [
+    "2024-02-29",   # 1: " 29/02/2024 " -> padded ISO
+    "2024-03-01",   # 2: already normalized, unchanged
+    "",             # 3: whitespace-only -> empty
+    "",             # 4: already empty (not counted as a change)
+]
+DATE_EXPECTED_CHANGED = 2
 
 
 def encode_csv(rows, *, bom):
@@ -298,6 +328,143 @@ class CsvCleanerCliTests(unittest.TestCase):
         self.assertIn("Name", stderr_text)
         self.assertFalse(output_path.exists())
         self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "date_bom" if bom else "date_nobom"
+                input_path, original_bytes = self.write_input(
+                    DATE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 4, "changed_cells": DATE_EXPECTED_CHANGED},
+                )
+
+                self.assertTrue(output_path.exists())
+                self.assertFalse(
+                    output_path.read_bytes().startswith(codecs.BOM_UTF8)
+                )
+
+                output_rows = self.read_output_records(output_path)
+                self.assertEqual(output_rows[0], DATE_HEADER)
+                self.assertEqual(len(output_rows), 5)
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    DATE_EXPECTED_DATES,
+                )
+                # The note column is never cleaned, so every note value,
+                # including the quoted newline, round-trips unchanged.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in DATE_ROWS],
+                )
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_header_only_file_exports_header(self):
+        input_path, original_bytes = self.write_input(
+            [DATE_HEADER], bom=False, tag="date_header_only"
+        )
+        output_path = self.tmpdir / "cleaned_date_header_only.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 0, "changed_cells": 0},
+        )
+        self.assertTrue(output_path.exists())
+        self.assertFalse(
+            output_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+        self.assertEqual(
+            self.read_output_records(output_path), [DATE_HEADER]
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_invalid_date_reports_csv_record_number(self):
+        # Record 2's note contains a quoted real newline, so it spans two
+        # physical lines but counts as one CSV record. The impossible date
+        # 31/02/2024 sits in the next record and must be reported as
+        # record 3, not physical line 4.
+        rows = [
+            DATE_HEADER,
+            [" 29/02/2024 ", "ok"],
+            ["31/02/2024", MULTILINE_NOTE],
+            ["2024-03-01", "ok"],
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag="date_invalid"
+        )
+        output_path = self.tmpdir / "cleaned_date_invalid.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        self.assertIn("invalid date", stderr_text)
+        self.assertIn("due_date", stderr_text)
+        self.assertIn("record 3", stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+        # No partially cleaned output may be left behind, and the input
+        # bytes stay untouched.
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_rejects_non_date_shapes(self):
+        # Each of these cells is non-empty after stripping yet is not an
+        # accepted date: impossible days, non-padded numbers, internal
+        # whitespace, time suffixes, null markers and fullwidth digits.
+        bad_values = [
+            "31/02/2024", "29/02/2023", "2024-02-30", "2024-13-01",
+            "0000-01-01", "2024-3-1", "1/3/2024", "2024 03 01",
+            "2024-03-01 10:00", "2024-03-01T00:00:00",
+            "NULL", "N/A", "２０２４-０３-０１",
+        ]
+        for index, bad_value in enumerate(bad_values):
+            with self.subTest(value=bad_value):
+                tag = f"date_bad_{index}"
+                input_path, original_bytes = self.write_input(
+                    [DATE_HEADER, [bad_value, "ok"]], bom=False, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 2", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
 
     def assert_invalid_input_fails(self, input_path, output_path,
                                    original_bytes, fragments):

@@ -15,9 +15,19 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
+from datetime import date
 
 NULL_MARKERS = frozenset({"null", "n/a"})
+
+# Accepted date shapes: ASCII digits only, zero-padded, no other characters.
+YMD_PATTERN = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
+DMY_PATTERN = re.compile(r"([0-9]{2})/([0-9]{2})/([0-9]{4})")
+
+
+class InvalidDateError(ValueError):
+    """Raised when a non-empty cell is not one of the accepted dates."""
 
 
 def ascii_lower(text):
@@ -41,9 +51,38 @@ def normalize_null(value):
     return value
 
 
+def normalize_date(value):
+    """Normalize one date cell to YYYY-MM-DD.
+
+    After stripping both ends, an empty result becomes the empty string.
+    Anything else must be either YYYY-MM-DD or DD/MM/YYYY with ASCII
+    digits, a four-digit year and two-digit month and day, denoting a
+    real Gregorian date in years 0001-9999; it is re-emitted as
+    YYYY-MM-DD. Internal whitespace, non-padded numbers, time suffixes
+    and markers such as NULL or N/A raise InvalidDateError.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    match = YMD_PATTERN.fullmatch(stripped)
+    if match is not None:
+        year, month, day = (int(group) for group in match.groups())
+    else:
+        match = DMY_PATTERN.fullmatch(stripped)
+        if match is None:
+            raise InvalidDateError(value)
+        day, month, year = (int(group) for group in match.groups())
+    try:
+        resolved = date(year, month, day)
+    except ValueError:
+        raise InvalidDateError(value) from None
+    return resolved.isoformat()
+
+
 RULES = {
     "trim": str.strip,
     "normalize-null": normalize_null,
+    "normalize-date": normalize_date,
 }
 
 
@@ -127,7 +166,11 @@ def main(argv=None):
             fail(f"record {record_no} has {len(record)} field(s), "
                  f"expected {expected_fields}")
         record = list(record)
-        cleaned = rule(record[column_index])
+        try:
+            cleaned = rule(record[column_index])
+        except InvalidDateError:
+            fail(f"invalid date in column {args.column!r} "
+                 f"at record {record_no}: {record[column_index]!r}")
         if cleaned != record[column_index]:
             record[column_index] = cleaned
             changed_cells += 1
