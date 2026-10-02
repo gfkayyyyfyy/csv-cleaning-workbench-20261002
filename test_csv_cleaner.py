@@ -25,6 +25,21 @@ The tests exercise only the documented public CLI:
   (the low year keeps four digits), 2000-02-29 is a century leap day in
   either spelling, and 1900-02-29, 29/02/2100, 0000-01-01 and
   01/01/10000 are each rejected at record 3 without partial output.
+* --null-marker: repeatable custom whole-value markers for the
+  normalize-null rule. They coexist with the default blank / NULL / N/A
+  handling; duplicate markers and markers equivalent to a default one
+  collapse without inflating the change count, matching strips both ends
+  and ignores ASCII letter case only (so " Ä " is not the marker "ä"),
+  and marker text embedded in a larger value never matches. Runs are
+  checked with and without a UTF-8 BOM (output is always BOM-free, header
+  and record order unchanged), the untouched note column carries marker
+  text, commas, double quotes and a real newline, and the input bytes
+  stay unchanged. A missing marker value, a value empty after str.strip()
+  (including ideographic-space-only values), or use with trim /
+  normalize-date fails with exit code 2, empty stdout, the corresponding
+  reason on stderr, no Python traceback, no output file and untouched
+  input bytes -- including for a header-only input; a header-only input
+  with valid markers exports just the header with both counts at 0.
 * invalid inputs (zero-byte file, BOM-only file, empty and duplicate
   header column names, an unterminated quoted field, invalid UTF-8 bytes
   and a record with too many fields following a record containing a
@@ -166,6 +181,42 @@ BOUNDARY_INVALID_VALUES = [
     "0000-01-01",   # year 0000 is one below the documented range
     "01/01/10000",  # a five-digit year is one above the documented range
 ]
+
+# --null-marker sample: five repeatable custom markers, two of which
+# overlap each other or a default marker after normalization, proving the
+# documented de-duplication: " MISSING " and "missing" strip/lower to the
+# same key (one match, counted once), and "null" is exactly equivalent to
+# the default NULL marker (still empties the cell, but adds no behavior).
+CUSTOM_MARKERS = [" MISSING ", "missing", "待补", "null", "ä"]
+
+# Nine name values, one row per documented boundary:
+CUSTOM_NULL_ROWS = [
+    HEADER,
+    ["", "null 与 n/a,文字"],                       # blank default: empty
+    ["   ", 'he said "hi, all"'],                  # whitespace default: empty
+    [" NuLl ", "line1\nline2"],                    # default NULL, padded+case
+    ["N/A", "普通,not a marker"],                   # default N/A: empty
+    [" missing ", '"quoted marker text"'],         # custom marker, padded
+    ["待补", "待补 stays here, embedded 待补 text"],  # custom Chinese marker
+    [" MISSINGLY ", "prefix MISSING suffix"],      # superstring: kept whole
+    [" Ä ", "ä appears here too"],                 # non-ASCII case: kept
+    [" 普通 ", "plain, with comma and 普通 text"],   # ordinary text: kept
+]
+# The first six names normalize to empty strings (the first one was
+# already empty, so only five cells change); the last three survive
+# character-for-character including their surrounding spaces.
+CUSTOM_NULL_EXPECTED_NAMES = [
+    "",              # 1: empty stays empty (not counted as a change)
+    "",              # 2: three ASCII spaces
+    "",              # 3: " NuLl " via the default NULL marker
+    "",              # 4: N/A via the default marker
+    "",              # 5: " missing " via a custom marker
+    "",              # 6: 待补 via a custom marker
+    " MISSINGLY ",   # 7: whole-value match only: verbatim
+    " Ä ",           # 8: ASCII-case folding only: verbatim
+    " 普通 ",         # 9: ordinary text: verbatim
+]
+CUSTOM_NULL_EXPECTED_CHANGED = 5
 
 
 def encode_csv(rows, *, bom):
@@ -756,6 +807,190 @@ class CsvCleanerCliTests(unittest.TestCase):
         self.assertEqual(
             result.stderr.decode("utf-8"),
             "error: record 3 has 3 field(s), expected 2\n",
+        )
+
+
+class NullMarkerCliTests(unittest.TestCase):
+    """Coverage for the repeatable --null-marker option.
+
+    The option is a public, documented feature of normalize-null but had
+    no command-line regression coverage. Every test here goes through the
+    public CLI with small CSV files prepared in a temporary directory; no
+    external files or network are used. Results are judged on parsed CSV
+    fields and the parsed JSON object, so equivalent quoting styles and
+    JSON key order are irrelevant.
+    """
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag):
+        data = encode_csv(rows, bom=bom)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, markers,
+                    rule="normalize-null", column="name"):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", column,
+            "--rule", rule,
+        ]
+        # A None entry stands for the bare flag with no following value.
+        for marker in markers:
+            argv.append("--null-marker")
+            if marker is not None:
+                argv.append(marker)
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def test_custom_null_markers_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "marker_bom" if bom else "marker_nobom"
+                input_path, original_bytes = self.write_input(
+                    CUSTOM_NULL_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path, markers=CUSTOM_MARKERS
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing non-whitespace.
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 9,
+                     "changed_cells": CUSTOM_NULL_EXPECTED_CHANGED},
+                )
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                # The export is always BOM-free UTF-8, even for BOM input.
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+
+                output_rows = self.read_output_records(output_path)
+                # Header and record order are unchanged.
+                self.assertEqual(output_rows[0], HEADER)
+                self.assertEqual(len(output_rows), 10)
+                # The first six names become empty strings; the last
+                # three survive character-for-character with spaces.
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    CUSTOM_NULL_EXPECTED_NAMES,
+                )
+                # The note column is never cleaned. Marker text, commas,
+                # double quotes and the embedded real newline must all
+                # round-trip unchanged in terms of parsed field values.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in CUSTOM_NULL_ROWS],
+                )
+
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_valid_markers_header_only_file_exports_header(self):
+        input_path, original_bytes = self.write_input(
+            [HEADER], bom=False, tag="marker_header_only"
+        )
+        output_path = self.tmpdir / "cleaned_marker_header_only.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            markers=[" MISSING ", "待补", "null"],
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 0, "changed_cells": 0},
+        )
+        self.assertTrue(output_path.exists())
+        self.assertFalse(
+            output_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+        self.assertEqual(
+            self.read_output_records(output_path), [HEADER]
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    # (label, --null-marker values (None = bare flag), rule, fragments
+    # that must each appear on stderr).
+    INVALID_MARKER_SCENARIOS = [
+        ("missing_value", [None], "normalize-null",
+         ["--null-marker", "expected one argument"]),
+        ("empty_string", [""], "normalize-null",
+         ["--null-marker", "non-empty",
+          "stripping surrounding whitespace"]),
+        # Two ideographic spaces U+3000 are non-empty raw arguments but
+        # empty after str.strip(); they must be rejected the same way.
+        ("fullwidth_space_only", ["　　"], "normalize-null",
+         ["--null-marker", "non-empty",
+          "stripping surrounding whitespace"]),
+        ("with_trim", ["x"], "trim",
+         ["--null-marker can only be used with --rule normalize-null"]),
+        ("with_normalize_date", ["x"], "normalize-date",
+         ["--null-marker can only be used with --rule normalize-null"]),
+    ]
+
+    def assert_invalid_markers_rejected(self, rows, *, bom, input_tag):
+        input_path, original_bytes = self.write_input(
+            rows, bom=bom, tag=input_tag
+        )
+        for label, markers, rule, fragments in self.INVALID_MARKER_SCENARIOS:
+            with self.subTest(label=label):
+                output_path = self.tmpdir / f"cleaned_{input_tag}_{label}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path, markers=markers, rule=rule
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                for fragment in fragments:
+                    self.assertIn(fragment, stderr_text)
+                # The failure must come through the documented error
+                # path: no interpreter traceback.
+                self.assertNotIn("Traceback", stderr_text)
+                # Parameter validation precedes every export, so no
+                # output file may be created...
+                self.assertFalse(output_path.exists())
+                # ...and the input is opened read-only: bytes unchanged.
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_invalid_markers_rejected_on_data_file(self):
+        self.assert_invalid_markers_rejected(
+            CUSTOM_NULL_ROWS, bom=False, input_tag="marker_bad_data"
+        )
+
+    def test_invalid_markers_rejected_on_header_only_file(self):
+        # A perfectly valid header-only input must not make any of the
+        # invalid parameter combinations acceptable.
+        self.assert_invalid_markers_rejected(
+            [HEADER], bom=False, input_tag="marker_bad_header"
         )
 
 
