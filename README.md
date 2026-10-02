@@ -19,7 +19,11 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 | `--input` | 输入 CSV 路径（逗号分隔、UTF-8、允许 BOM，首条记录为表头；只读，不会被修改） |
 | `--output` | 输出 CSV 路径（必须是不存在的新文件，且不能与输入指向同一文件；输出为无 BOM 的 UTF-8 CSV） |
 | `--column` | 要清洗的列名，与表头精确匹配（区分大小写），只选一列 |
-| `--rule` | 清洗规则，当前仅支持 `trim`（按 `str.strip` 语义去除单元格两端空白，保留内部空白） |
+| `--rule` | 清洗规则，当前支持 `trim`（按 `str.strip` 语义去除单元格两端空白，保留内部空白）与 `normalize-null`（见下） |
+
+`normalize-null`：先按 `str.strip` 去掉两端空白，若结果为空，或与 `NULL`、`N/A`
+做忽略 ASCII 字母大小写的完整匹配，则结果为空字符串；未命中时保留原字符串
+（包括两端空白），普通文本中包含标记不会被判为空，例如 `NULLABLE` 保持不变。
 
 成功时退出码为 0，标准输出只有一个 JSON 对象，例如 `{"rows": 3, "changed_cells": 2}`：
 `rows` 为数据记录数（不含表头），`changed_cells` 为清理前后字符串发生变化的单元格数。

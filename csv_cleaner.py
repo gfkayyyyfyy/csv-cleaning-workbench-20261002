@@ -17,8 +17,33 @@ import json
 import os
 import sys
 
+NULL_MARKERS = frozenset({"null", "n/a"})
+
+
+def ascii_lower(text):
+    """Lowercase ASCII A-Z only; all other characters stay untouched."""
+    return "".join(
+        chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text
+    )
+
+
+def normalize_null(value):
+    """Normalize fixed null markers to an empty string.
+
+    After stripping both ends, the cell becomes empty when the result is
+    empty or matches NULL / N/A case-insensitively with respect to ASCII
+    letters. Anything else is returned byte-for-byte, including its
+    surrounding whitespace (e.g. "NULLABLE" is not a marker).
+    """
+    stripped = value.strip()
+    if not stripped or ascii_lower(stripped) in NULL_MARKERS:
+        return ""
+    return value
+
+
 RULES = {
     "trim": str.strip,
+    "normalize-null": normalize_null,
 }
 
 
