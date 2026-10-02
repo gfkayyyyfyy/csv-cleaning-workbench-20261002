@@ -281,5 +281,158 @@ class CsvCleanerCliTests(unittest.TestCase):
         self.assertEqual(input_path.read_bytes(), original_bytes)
 
 
+    def write_raw_input(self, data, *, tag):
+        """Write raw CSV bytes as a dedicated temp input file."""
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def assert_failure_leaves_no_trace(
+        self, result, *, input_path, original_bytes, output_path,
+        reason_snippets,
+    ):
+        """Shared contract for every documented failure:
+
+        exit code 2, empty stdout, a reason on stderr without a Python
+        traceback, no output file at the given path, and the input bytes
+        untouched. reason_snippets is a string (or strings) that must all
+        appear in stderr; path/OS-dependent wording is never pinned.
+        """
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        if isinstance(reason_snippets, str):
+            reason_snippets = [reason_snippets]
+        for snippet in reason_snippets:
+            self.assertIn(snippet, stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_zero_byte_and_bom_only_files_report_no_header(self):
+        # Both an empty file and a file containing only a UTF-8 BOM have no
+        # header record once the BOM is stripped, so neither may be treated
+        # as a header-only success.
+        for tag, data in (
+            ("empty_zero", b""),
+            ("empty_bom", codecs.BOM_UTF8),
+        ):
+            with self.subTest(tag=tag):
+                input_path, original_bytes = self.write_raw_input(
+                    data, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(input_path, output_path)
+
+                self.assert_failure_leaves_no_trace(
+                    result,
+                    input_path=input_path,
+                    original_bytes=original_bytes,
+                    output_path=output_path,
+                    reason_snippets="input is empty: no header record",
+                )
+
+    def test_header_with_empty_column_name_is_rejected(self):
+        # "name," parses as a header whose second column name is empty.
+        input_path, original_bytes = self.write_raw_input(
+            b"name,", tag="empty_column_name"
+        )
+        output_path = self.tmpdir / "cleaned_empty_column_name.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assert_failure_leaves_no_trace(
+            result,
+            input_path=input_path,
+            original_bytes=original_bytes,
+            output_path=output_path,
+            reason_snippets="header contains an empty column name",
+        )
+
+    def test_header_with_duplicate_column_names_is_rejected(self):
+        input_path, original_bytes = self.write_raw_input(
+            b"name,name\n", tag="duplicate_column_name"
+        )
+        output_path = self.tmpdir / "cleaned_duplicate_column_name.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assert_failure_leaves_no_trace(
+            result,
+            input_path=input_path,
+            original_bytes=original_bytes,
+            output_path=output_path,
+            reason_snippets="header contains duplicate column names",
+        )
+
+    def test_unclosed_quote_after_cleanable_record_fails_without_output(self):
+        # Record 2 (" Alice ", ok) would clean successfully, but parsing
+        # never finishes: record 3 opens a quote that runs to EOF. The
+        # parse failure must win, and no partial result may be exported.
+        input_path, original_bytes = self.write_raw_input(
+            b'name,note\n Alice ,ok\n"broken', tag="unclosed_quote"
+        )
+        output_path = self.tmpdir / "cleaned_unclosed_quote.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assert_failure_leaves_no_trace(
+            result,
+            input_path=input_path,
+            original_bytes=original_bytes,
+            output_path=output_path,
+            reason_snippets=["cannot parse CSV", "unexpected end of data"],
+        )
+
+    def test_invalid_utf8_after_valid_header_is_rejected(self):
+        # A well-formed header followed by a lone 0xFF byte is a UTF-8
+        # decoding failure, distinct from a CSV syntax failure.
+        input_path, original_bytes = self.write_raw_input(
+            b"name,note\nAlice,\xff\n", tag="invalid_utf8"
+        )
+        output_path = self.tmpdir / "cleaned_invalid_utf8.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assert_failure_leaves_no_trace(
+            result,
+            input_path=input_path,
+            original_bytes=original_bytes,
+            output_path=output_path,
+            reason_snippets="is not valid UTF-8",
+        )
+
+    def test_too_many_fields_uses_record_number_and_exports_nothing(self):
+        # Record 2 is cleanable: " Alice " trims to "Alice" and its note is
+        # one quoted field spanning a real newline. Record 3 has three
+        # fields against a two-column header. The quoted newline must not
+        # advance the record counter, and the cleanable Alice record must
+        # not be exported as a partial result.
+        input_path, original_bytes = self.write_raw_input(
+            b'name,note\n Alice ,"line one\nline two"\nBob,z,extra\n',
+            tag="extra_fields",
+        )
+        output_path = self.tmpdir / "cleaned_extra_fields.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        # This message carries no path, so its exact text can be pinned.
+        self.assertEqual(
+            result.stderr.decode("utf-8"),
+            "error: record 3 has 3 field(s), expected 2\n",
+        )
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+
 if __name__ == "__main__":
     unittest.main()
