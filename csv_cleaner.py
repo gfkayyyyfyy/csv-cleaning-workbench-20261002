@@ -37,18 +37,34 @@ def ascii_lower(text):
     )
 
 
-def normalize_null(value):
-    """Normalize fixed null markers to an empty string.
+def normalize_null(value, markers=NULL_MARKERS):
+    """Normalize null markers to an empty string.
 
     After stripping both ends, the cell becomes empty when the result is
-    empty or matches NULL / N/A case-insensitively with respect to ASCII
-    letters. Anything else is returned byte-for-byte, including its
-    surrounding whitespace (e.g. "NULLABLE" is not a marker).
+    empty or matches one of the markers case-insensitively with respect
+    to ASCII letters. The default markers are NULL and N/A; a single run
+    may add more via make_null_normalizer. Anything else is returned
+    byte-for-byte, including its surrounding whitespace (e.g. "NULLABLE"
+    is not a marker).
     """
     stripped = value.strip()
-    if not stripped or ascii_lower(stripped) in NULL_MARKERS:
+    if not stripped or ascii_lower(stripped) in markers:
         return ""
     return value
+
+
+def make_null_normalizer(extra_markers=()):
+    """Build a normalize-null callable carrying run-specific markers.
+
+    The built-in NULL / N/A markers are always kept. Each extra marker
+    is stripped with str.strip semantics and ASCII-letter-lowercased for
+    comparison, so both the marker and the cell are stripped before a
+    whole-value, ASCII-case-insensitive match. Markers that duplicate
+    each other or a built-in marker are accepted and harmless.
+    """
+    markers = set(NULL_MARKERS)
+    markers.update(ascii_lower(marker.strip()) for marker in extra_markers)
+    return lambda value: normalize_null(value, markers)
 
 
 def normalize_date(value):
@@ -108,6 +124,14 @@ def parse_args(argv):
     parser.add_argument("--rule", required=True,
                         help="cleaning rule to apply (supported: "
                              + ", ".join(sorted(RULES)) + ")")
+    parser.add_argument(
+        "--null-marker", dest="null_markers", action="append", default=[],
+        metavar="MARKER",
+        help="additional whole-value marker the normalize-null rule turns "
+             "into an empty string; compared after str.strip on both sides "
+             "and ignoring ASCII letter case. May be given more than once; "
+             "only valid with --rule normalize-null.",
+    )
     return parser.parse_args(argv)
 
 
@@ -140,6 +164,18 @@ def main(argv=None):
     if rule is None:
         fail(f"unsupported rule {args.rule!r} "
              f"(supported: {', '.join(sorted(RULES))})")
+
+    # --null-marker validation is argument validation, so it runs before
+    # any file is touched: a header-only input must not mask a bad marker.
+    for marker in args.null_markers:
+        if not marker.strip():
+            fail("--null-marker requires a value containing at least one "
+                 "non-whitespace character")
+    if args.null_markers and args.rule != "normalize-null":
+        fail(f"--null-marker is only supported with --rule normalize-null, "
+             f"not {args.rule!r}")
+    if args.rule == "normalize-null":
+        rule = make_null_normalizer(args.null_markers)
 
     if os.path.abspath(args.input) == os.path.abspath(args.output):
         fail("output path must be different from the input path")

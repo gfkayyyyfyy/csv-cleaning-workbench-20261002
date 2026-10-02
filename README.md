@@ -20,10 +20,16 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 | `--output` | 输出 CSV 路径（必须是不存在的新文件，且不能与输入指向同一文件；输出为无 BOM 的 UTF-8 CSV） |
 | `--column` | 要清洗的列名，与表头精确匹配（区分大小写），只选一列 |
 | `--rule` | 清洗规则，当前支持 `trim`（按 `str.strip` 语义去除单元格两端空白，保留内部空白）、`normalize-null` 与 `normalize-date`（见下） |
+| `--null-marker MARKER` | 仅可配合 `normalize-null` 使用的可选项，可重复提供，每次追加一个本次调用生效的额外空值标记 |
 
 `normalize-null`：先按 `str.strip` 去掉两端空白，若结果为空，或与 `NULL`、`N/A`
-做忽略 ASCII 字母大小写的完整匹配，则结果为空字符串；未命中时保留原字符串
-（包括两端空白），普通文本中包含标记不会被判为空，例如 `NULLABLE` 保持不变。
+（以及每次调用通过 `--null-marker` 追加的标记）做忽略 ASCII 字母大小写的完整匹配，
+则结果为空字符串；未命中时保留原字符串（包括两端空白），普通文本中包含标记不会被判
+为空，例如 `NULLABLE` 保持不变。额外标记同样先按 `str.strip` 去除两端空白再比较，
+仅忽略 ASCII 字母大小写（其余字符精确匹配，全角字母不视为大小写变体），且只做整值
+匹配，不做包含、前缀或正则匹配；标记两端带空白时只影响比较语义，命中的单元格仍输出
+空字符串。重复提供或与默认标记相同的值均可以接受，不会重复统计变化。额外标记仅作用于
+本次指定的列；不提供 `--null-marker` 时行为与默认完全一致。
 
 `normalize-date`：先按 `str.strip` 去掉两端空白，空字符串或纯空白输出为空；其余
 只接受 `YYYY-MM-DD` 与 `DD/MM/YYYY` 两种写法，要求 ASCII 数字、四位年份、两位月日，
@@ -39,6 +45,9 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 规则不支持、列不存在、输入为空、表头含空名或重名、记录列数与表头不一致、目标列含非法
 日期（报错含列名与从表头记为第 1 条开始的记录序号，引号内换行不计入）、CSV 无法解析、
 输入不存在、UTF-8 解码失败、读写失败、输出已存在或与输入同路径（已有内容保留不变）。
+`--null-marker` 缺少取值、取值经 `str.strip` 后为空，或与 `trim`、`normalize-date`
+搭配使用，同样以退出码 2 拒绝；该参数校验先于文件读取，仅含表头的输入也不会让无效
+参数蒙混过关。
 
 ### 示例
 
