@@ -5,6 +5,12 @@ Usage:
     python csv_cleaner.py --input input.csv --output cleaned.csv \
         --column name --rule trim
 
+normalize-null additionally accepts repeatable custom null markers:
+
+    python csv_cleaner.py --input input.csv --output cleaned.csv \
+        --column name --rule normalize-null \
+        --null-marker MISSING --null-marker 待补
+
 On success prints a single JSON object to stdout, e.g.
     {"rows": 3, "changed_cells": 2}
 and exits 0. Any failure exits 2 with the reason on stderr and no output
@@ -18,6 +24,7 @@ import os
 import re
 import sys
 from datetime import date
+from functools import partial
 
 NULL_MARKERS = frozenset({"null", "n/a"})
 
@@ -37,16 +44,22 @@ def ascii_lower(text):
     )
 
 
-def normalize_null(value):
-    """Normalize fixed null markers to an empty string.
+def normalize_null(value, extra_markers=frozenset()):
+    """Normalize null markers to an empty string.
 
     After stripping both ends, the cell becomes empty when the result is
-    empty or matches NULL / N/A case-insensitively with respect to ASCII
-    letters. Anything else is returned byte-for-byte, including its
-    surrounding whitespace (e.g. "NULLABLE" is not a marker).
+    empty or matches NULL / N/A (or any of the given extra markers)
+    case-insensitively with respect to ASCII letters. Anything else is
+    returned byte-for-byte, including its surrounding whitespace (e.g.
+    "NULLABLE" is not a marker). Extra markers are compared after
+    str.strip() themselves; duplicate markers collapse into one match but
+    never inflate the change count.
     """
     stripped = value.strip()
-    if not stripped or ascii_lower(stripped) in NULL_MARKERS:
+    if not stripped:
+        return ""
+    lowered = ascii_lower(stripped)
+    if lowered in NULL_MARKERS or lowered in extra_markers:
         return ""
     return value
 
@@ -108,6 +121,12 @@ def parse_args(argv):
     parser.add_argument("--rule", required=True,
                         help="cleaning rule to apply (supported: "
                              + ", ".join(sorted(RULES)) + ")")
+    parser.add_argument("--null-marker", action="append", default=[],
+                        metavar="MARKER",
+                        help="additional whole-value null marker for "
+                             "normalize-null (may be repeated; the value "
+                             "is stripped at both ends and compared "
+                             "case-insensitively on ASCII letters only)")
     return parser.parse_args(argv)
 
 
@@ -140,6 +159,21 @@ def main(argv=None):
     if rule is None:
         fail(f"unsupported rule {args.rule!r} "
              f"(supported: {', '.join(sorted(RULES))})")
+
+    # --null-marker is only meaningful for normalize-null, and every
+    # marker must name a non-empty value after str.strip() (whitespace
+    # around the marker is tolerated; whitespace-only markers are not).
+    if args.null_marker and args.rule != "normalize-null":
+        fail("--null-marker can only be used with --rule normalize-null")
+    extra_markers = set()
+    for marker in args.null_marker:
+        stripped_marker = marker.strip()
+        if not stripped_marker:
+            fail("--null-marker requires a value that is non-empty "
+                 "after stripping surrounding whitespace")
+        extra_markers.add(ascii_lower(stripped_marker))
+    if args.rule == "normalize-null":
+        rule = partial(normalize_null, extra_markers=extra_markers)
 
     if os.path.abspath(args.input) == os.path.abspath(args.output):
         fail("output path must be different from the input path")
