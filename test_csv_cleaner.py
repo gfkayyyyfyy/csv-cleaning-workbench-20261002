@@ -23,6 +23,15 @@ The tests exercise only the documented public CLI:
   reason on stderr without a Python traceback; no output file is left
   behind, even when an earlier record could already have been cleaned,
   and the input bytes stay untouched.
+* output path protection: for each rule, an output path that already
+  names a regular file is refused whether that file holds valid CSV or
+  non-UTF-8 bytes, and both the target and the legal input stay
+  byte-for-byte intact; an output path that names the input file itself,
+  given verbatim or via a different spelling containing a "." segment,
+  is refused without deleting or rewriting the input. Every refusal
+  exits 2 with empty stdout, the documented reason on stderr, no Python
+  traceback and no extra cleaned file. A single-row trim run to a
+  brand-new path serves as the success control.
 """
 
 import codecs
@@ -440,6 +449,184 @@ class CsvCleanerCliTests(unittest.TestCase):
             result.stderr.decode("utf-8"),
             "error: record 3 has 3 field(s), expected 2\n",
         )
+
+    def assert_refusal(self, result, *, reason_fragment):
+        """Common assertions for a documented output-path refusal.
+
+        Exit code 2, empty stdout, the given reason fragment on stderr,
+        and no Python traceback. File-preservation assertions stay with
+        the individual cases, which know which bytes to compare.
+        """
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
+        self.assertIn(reason_fragment, stderr_text)
+        # The refusal must come through the documented error path rather
+        # than an uncaught exception.
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertNotIn("Error:", stderr_text)
+        return stderr_text
+
+    def test_existing_output_file_is_refused_for_trim_and_normalize_null(self):
+        # An already-present regular file at the output path blocks the
+        # export before the input is ever read: exit 2, empty stdout, the
+        # documented reason on stderr, and both files byte-for-byte as
+        # they were. The input stays a legal CSV with the named column
+        # present and one cleanable value, so path protection -- not an
+        # input error -- is what fails the run. The target is checked as
+        # valid CSV and as raw non-UTF-8 bytes.
+        existing_targets = [
+            ("valid_csv",
+             encode_csv([["keep", "me"], ["unchanged", "data"]], bom=False)),
+            ("non_utf8", b"keep,\xff\n"),
+        ]
+        cases = [
+            ("trim", [HEADER, [" Alice ", "x,y"]]),
+            ("normalize-null", [HEADER, [" NULL ", "plain"]]),
+        ]
+        for rule, rows in cases:
+            for target_tag, target_bytes in existing_targets:
+                with self.subTest(rule=rule, target=target_tag):
+                    input_path, input_bytes = self.write_input(
+                        rows, bom=False,
+                        tag=f"exists_in_{rule.replace('-', '_')}_{target_tag}",
+                    )
+                    output_path = self.tmpdir / (
+                        f"existing_{rule.replace('-', '_')}_{target_tag}.csv"
+                    )
+                    output_path.write_bytes(target_bytes)
+                    before = sorted(p.name for p in self.tmpdir.iterdir())
+
+                    result = self.run_cleaner(
+                        input_path, output_path, rule=rule
+                    )
+
+                    self.assert_refusal(
+                        result, reason_fragment="output file already exists"
+                    )
+                    # The existing target survives with its exact bytes,
+                    # even when those bytes are not valid UTF-8...
+                    self.assertEqual(
+                        output_path.read_bytes(), target_bytes
+                    )
+                    # ...and the legal input is never rewritten.
+                    self.assertEqual(input_path.read_bytes(), input_bytes)
+                    # No extra cleaned file appears in the temp directory.
+                    self.assertEqual(
+                        sorted(p.name for p in self.tmpdir.iterdir()),
+                        before,
+                    )
+
+    def test_output_equal_to_input_path_is_refused_for_both_rules(self):
+        # Same string for --input and --output must be refused without
+        # touching the input. Each rule gets a legal CSV whose named
+        # column holds a value the rule would clean.
+        cases = [
+            ("trim", [HEADER, [" Alice ", "x,y"]]),
+            ("normalize-null", [HEADER, [" N/A ", "plain"]]),
+        ]
+        for rule, rows in cases:
+            with self.subTest(rule=rule):
+                input_path, input_bytes = self.write_input(
+                    rows, bom=False, tag=f"same_path_{rule.replace('-', '_')}"
+                )
+                before = sorted(p.name for p in self.tmpdir.iterdir())
+
+                result = self.run_cleaner(
+                    input_path, input_path, rule=rule
+                )
+
+                self.assert_refusal(
+                    result,
+                    reason_fragment="output path must be different from the "
+                                    "input path",
+                )
+                self.assertTrue(input_path.exists())
+                self.assertEqual(input_path.read_bytes(), input_bytes)
+                self.assertEqual(
+                    sorted(p.name for p in self.tmpdir.iterdir()),
+                    before,
+                )
+
+    def test_dot_segment_spelling_of_input_path_is_refused_for_both_rules(
+        self,
+    ):
+        # --output spelled differently but resolving to the same file
+        # (a redundant "." path segment) must be recognized as the same
+        # path and refused; the input must not be deleted or rewritten.
+        cases = [
+            ("trim", [HEADER, [" Alice ", "x,y"]]),
+            ("normalize-null", [HEADER, ["null", "plain"]]),
+        ]
+        for rule, rows in cases:
+            with self.subTest(rule=rule):
+                input_path, input_bytes = self.write_input(
+                    rows, bom=False,
+                    tag=f"dot_segment_in_{rule.replace('-', '_')}",
+                )
+                # A genuinely different spelling: same resolved file, with
+                # a "." segment the input spelling does not have. Build it
+                # as a raw string so pathlib does not collapse it for us.
+                alternate = os.path.join(
+                    str(input_path.parent), ".", input_path.name
+                )
+                self.assertNotEqual(alternate, str(input_path))
+                self.assertEqual(
+                    os.path.abspath(alternate),
+                    os.path.abspath(str(input_path)),
+                )
+                before = sorted(p.name for p in self.tmpdir.iterdir())
+
+                result = self.run_cleaner(
+                    input_path, alternate, rule=rule
+                )
+
+                self.assert_refusal(
+                    result,
+                    reason_fragment="output path must be different from the "
+                                    "input path",
+                )
+                self.assertTrue(input_path.exists())
+                self.assertEqual(input_path.read_bytes(), input_bytes)
+                self.assertEqual(
+                    sorted(p.name for p in self.tmpdir.iterdir()),
+                    before,
+                )
+
+    def test_trim_single_row_exports_to_new_path(self):
+        # Success control for the output-path protection cases: a legal
+        # single-record input exported to a path that does not yet exist
+        # exits 0 with empty stderr, exactly one JSON summary object on
+        # stdout, a BOM-free UTF-8 output whose parsed values are the
+        # trimmed results, and untouched input bytes.
+        input_path, original_bytes = self.write_input(
+            [HEADER, [" Alice ", "x,y"]], bom=False, tag="single"
+        )
+        output_path = self.tmpdir / "cleaned.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(input_path, output_path, rule="trim")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        # stdout must consist of exactly the one JSON object and nothing
+        # else; json.loads rejects trailing non-whitespace, and the
+        # object must carry precisely the documented keys and values
+        # regardless of key order.
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 1, "changed_cells": 1},
+        )
+
+        self.assertTrue(output_path.exists())
+        raw_output = output_path.read_bytes()
+        raw_output.decode("utf-8")  # must be valid UTF-8...
+        self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))  # ...no BOM
+        self.assertEqual(
+            self.read_output_records(output_path),
+            [HEADER, ["Alice", "x,y"]],
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
 
 
 if __name__ == "__main__":
