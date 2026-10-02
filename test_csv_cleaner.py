@@ -20,7 +20,12 @@ The tests exercise only the documented public CLI:
   YYYY-MM-DD or DD/MM/YYYY (ASCII digits, zero-padded) normalize to
   YYYY-MM-DD, and the first invalid date (internal whitespace, unpadded
   numbers, time suffixes, NULL/N/A text, nonexistent calendar dates)
-  fails by CSV record number without exporting anything.
+  fails by CSV record number without exporting anything. A dedicated
+  boundary group pins the documented 0001-9999 year range: the first
+  and last admissible years and the year-2000 century leap day convert
+  (with and without a UTF-8 BOM, low years staying four digits), while
+  year 0000, the five-digit year 10000 and the non-leap century days
+  1900-02-29 / 29/02/2100 are rejected.
 * invalid inputs (zero-byte file, BOM-only file, empty and duplicate
   header column names, an unterminated quoted field, invalid UTF-8 bytes
   and a record with too many fields following a record containing a
@@ -130,6 +135,39 @@ INVALID_DATE_VALUES = [
     "2024/03/01",        # slashes only in DD/MM/YYYY order
     "01-03-2024",        # dashes only in YYYY-MM-DD order
 ]
+
+# Year-range and century-leap boundaries for the documented 0001-9999
+# Gregorian support. Note fields again carry the quoting hazards (a
+# comma, double quotes, a real newline) and round-trip untouched.
+BOUNDARY_DATE_ROWS = [
+    DATE_HEADER,
+    ["01/01/0001", "low edge, keep \"0001\", with comma"],  # year 0001
+    ["9999-12-31", 'he said "high edge"\nline two'],        # year 9999
+    [" 29/02/2000 ", "century leap day, padded"],           # 2000 leap day
+    ["2000-02-29", "already normalized"],                   # same leap day
+]
+BOUNDARY_EXPECTED_DATES = [
+    "0001-01-01",
+    "9999-12-31",
+    "2000-02-29",
+    "2000-02-29",
+]
+# Only the first and third values change spelling: the low edge converts
+# from DD/MM/YYYY and the leap day loses its surrounding spaces, while
+# 9999-12-31 and the last 2000-02-29 were already canonical.
+BOUNDARY_EXPECTED_CHANGED = 2
+
+# Each case is (label, raw invalid cell spelling). The failure fixture
+# always wraps the invalid value at CSV record 3, preceded by a cleanable
+# record whose note embeds a real newline and followed by a second
+# invalid date that must never be reported.
+BOUNDARY_INVALID_CASES = [
+    ("year_1900_not_leap", "1900-02-29"),  # 1900 is not a century leap year
+    ("year_2100_not_leap", "29/02/2100"),  # 2100 is not a century leap year
+    ("year_0000", "0000-01-01"),           # below the 0001 lower bound
+    ("year_10000", "01/01/10000"),         # five-digit year, above 9999
+]
+BOUNDARY_TRAILING_INVALID = "31/04/2000"
 
 
 def encode_csv(rows, *, bom):
@@ -466,6 +504,103 @@ class CsvCleanerCliTests(unittest.TestCase):
                 self.assertIn("due_date", stderr_text)
                 self.assertIn("record 2", stderr_text)
                 self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_year_boundaries_with_and_without_bom(self):
+        # The documented 0001-9999 Gregorian range: its first and last
+        # days convert, the year-2000 century leap day converts in both
+        # spellings (one padded with spaces), the four-digit low year is
+        # preserved, and an already canonical value is not counted as a
+        # change. Run once per UTF-8 input spelling (with/without BOM);
+        # the output is always BOM-free.
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "date_edge_bom" if bom else "date_edge_nobom"
+                input_path, original_bytes = self.write_input(
+                    BOUNDARY_DATE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing non-whitespace.
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 4,
+                     "changed_cells": BOUNDARY_EXPECTED_CHANGED},
+                )
+
+                self.assertTrue(output_path.exists())
+                self.assertFalse(
+                    output_path.read_bytes().startswith(codecs.BOM_UTF8)
+                )
+
+                output_rows = self.read_output_records(output_path)
+                # Header and record order are unchanged.
+                self.assertEqual(output_rows[0], DATE_HEADER)
+                self.assertEqual(len(output_rows), 5)
+                # The due_date column follows the boundary expectations.
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    BOUNDARY_EXPECTED_DATES,
+                )
+                # The note column is never cleaned, so the comma, double
+                # quotes and embedded newlines round-trip byte-for-byte
+                # in terms of parsed field values.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in BOUNDARY_DATE_ROWS],
+                )
+
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_rejects_out_of_range_and_non_leap_centuries(self):
+        # For each boundary violation: record 2 is a cleanable leap-day
+        # value whose note embeds a real newline (so it spans physical
+        # lines but stays CSV record 2), record 3 is the invalid value
+        # and record 4 is a second impossible date, 31/04/2000, which
+        # must not be reported because processing stops at record 3.
+        for label, invalid_value in BOUNDARY_INVALID_CASES:
+            with self.subTest(case=label):
+                rows = [
+                    DATE_HEADER,
+                    [" 29/02/2000 ", MULTILINE_NOTE],
+                    [invalid_value, "boundary violation"],
+                    [BOUNDARY_TRAILING_INVALID, "must not be reported"],
+                ]
+                input_path, original_bytes = self.write_input(
+                    rows, bom=False, tag=f"date_edge_bad_{label}"
+                )
+                output_path = self.tmpdir / f"cleaned_edge_bad_{label}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 3", stderr_text)
+                # The first invalid value is quoted in the message.
+                self.assertIn(invalid_value, stderr_text)
+                # The trailing impossible date is never reached.
+                self.assertNotIn(BOUNDARY_TRAILING_INVALID, stderr_text)
+                self.assertNotIn("record 4", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                # No partially cleaned output and untouched input bytes.
                 self.assertFalse(output_path.exists())
                 self.assertEqual(input_path.read_bytes(), original_bytes)
 
