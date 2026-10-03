@@ -1158,5 +1158,237 @@ class OutputPathProtectionTests(unittest.TestCase):
         self.assertEqual(input_path.read_bytes(), input_bytes)
 
 
+class IncludeChangesCliTests(unittest.TestCase):
+    """Coverage for the --include-changes switch.
+
+    Without the switch the success summary keeps its exact two-key shape;
+    with it the same JSON object gains a "changes" array holding one
+    {record, column, before, after} entry per changed cell, in record
+    order, and the exported CSV is identical either way.
+    """
+
+    # Four data records: the second record's note carries a quoted real
+    # newline so record numbers (header is 1) diverge from physical lines.
+    CHANGES_ROWS = [
+        HEADER,
+        [" Alice ", "plain"],          # record 2: trims to "Alice"
+        ["Bob", MULTILINE_NOTE],       # record 3: unchanged
+        ["   ", QUOTED_NOTE],          # record 4: whitespace-only -> ""
+        ["", "x,y"],                   # record 5: already empty, no change
+    ]
+    CHANGES_EXPECTED_NAMES = ["Alice", "Bob", "", ""]
+    CHANGES_EXPECTED = [
+        {"record": 2, "column": "name", "before": " Alice ",
+         "after": "Alice"},
+        {"record": 4, "column": "name", "before": "   ", "after": ""},
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag):
+        data = encode_csv(rows, bom=bom)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, include_changes,
+                    rule="trim", column="name", extra_args=()):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", column,
+            "--rule", rule,
+        ]
+        if include_changes:
+            argv.append("--include-changes")
+        argv.extend(extra_args)
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def test_changes_detail_matches_changed_cells(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "changes_bom" if bom else "changes_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.CHANGES_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path, include_changes=True
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing non-whitespace.
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(
+                    summary,
+                    {"rows": 4,
+                     "changed_cells": 2,
+                     "changes": self.CHANGES_EXPECTED},
+                )
+                # One detail entry per changed cell, nothing more.
+                self.assertEqual(
+                    len(summary["changes"]), summary["changed_cells"]
+                )
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                output_rows = self.read_output_records(output_path)
+                # Header, record order and the untouched note column
+                # (commas, double quotes, embedded newline) are preserved.
+                self.assertEqual(output_rows[0], HEADER)
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    self.CHANGES_EXPECTED_NAMES,
+                )
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in self.CHANGES_ROWS],
+                )
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_export_is_identical_with_and_without_switch(self):
+        input_path, _ = self.write_input(
+            self.CHANGES_ROWS, bom=False, tag="changes_same_export"
+        )
+        outputs = {}
+        for include_changes in (False, True):
+            tag = "with" if include_changes else "without"
+            output_path = self.tmpdir / f"cleaned_same_{tag}.csv"
+            result = self.run_cleaner(
+                input_path, output_path, include_changes=include_changes
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, b"")
+            outputs[include_changes] = output_path.read_bytes()
+        self.assertEqual(outputs[False], outputs[True])
+
+    def test_summary_without_switch_has_no_changes_key(self):
+        input_path, _ = self.write_input(
+            self.CHANGES_ROWS, bom=False, tag="changes_off"
+        )
+        output_path = self.tmpdir / "cleaned_changes_off.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path, include_changes=False
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 4, "changed_cells": 2},
+        )
+
+    def test_changes_empty_for_header_only_and_unchanged_inputs(self):
+        for tag, rows in (
+            ("header_only", [HEADER]),
+            ("no_changes", [HEADER, ["Alice", "ok"], ["Bob", "x,y"]]),
+        ):
+            with self.subTest(tag=tag):
+                input_path, _ = self.write_input(rows, bom=False, tag=tag)
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+
+                result = self.run_cleaner(
+                    input_path, output_path, include_changes=True
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(summary["changed_cells"], 0)
+                self.assertEqual(summary["changes"], [])
+
+    def test_changes_cover_all_rules_and_custom_markers(self):
+        # Each rule reports the same {record, column, before, after} shape;
+        # duplicate custom markers still yield one entry per changed cell.
+        scenarios = [
+            ("normalize-null", "name", NULL_ROWS, ["--null-marker", "待补"],
+             [
+                 {"record": 3, "column": "name", "before": "   ",
+                  "after": ""},
+                 {"record": 4, "column": "name", "before": "NuLl",
+                  "after": ""},
+                 {"record": 5, "column": "name", "before": " n/A ",
+                  "after": ""},
+                 {"record": 11, "column": "name", "before": "　NULL　",
+                  "after": ""},
+             ]),
+            ("normalize-date", "due_date", DATE_ROWS, [],
+             [
+                 {"record": 2, "column": "due_date",
+                  "before": " 29/02/2024 ", "after": "2024-02-29"},
+                 {"record": 4, "column": "due_date", "before": "   ",
+                  "after": ""},
+             ]),
+        ]
+        for rule, column, rows, extra_args, expected_changes in scenarios:
+            with self.subTest(rule=rule):
+                input_path, _ = self.write_input(
+                    rows, bom=False, tag=f"changes_{rule}"
+                )
+                output_path = self.tmpdir / f"cleaned_changes_{rule}.csv"
+
+                result = self.run_cleaner(
+                    input_path, output_path, include_changes=True,
+                    rule=rule, column=column, extra_args=extra_args,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(summary["changes"], expected_changes)
+                self.assertEqual(
+                    summary["changed_cells"], len(expected_changes)
+                )
+
+    def test_failure_with_switch_prints_no_summary_or_changes(self):
+        # The third data record has the wrong field count; with the switch
+        # on, the failure shape is unchanged: exit 2, empty stdout, the
+        # reason (record 4) on stderr and no output file.
+        rows = [
+            HEADER,
+            [" Alice ", "plain"],
+            ["Bob", MULTILINE_NOTE],
+            ["   "],
+            ["", QUOTED_NOTE],
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag="changes_bad"
+        )
+        output_path = self.tmpdir / "cleaned_changes_bad.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path, include_changes=True
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(
+            result.stderr.decode("utf-8"),
+            "error: record 4 has 1 field(s), expected 2\n",
+        )
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+
 if __name__ == "__main__":
     unittest.main()

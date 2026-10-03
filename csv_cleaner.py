@@ -15,6 +15,10 @@ On success prints a single JSON object to stdout, e.g.
     {"rows": 3, "changed_cells": 2}
 and exits 0. Any failure exits 2 with the reason on stderr and no output
 file is created.
+
+With --include-changes the same JSON object gains a "changes" array with
+one {"record", "column", "before", "after"} entry per changed cell, in
+record order; no separate detail file is written.
 """
 
 import argparse
@@ -127,6 +131,10 @@ def parse_args(argv):
                              "normalize-null (may be repeated; the value "
                              "is stripped at both ends and compared "
                              "case-insensitively on ASCII letters only)")
+    parser.add_argument("--include-changes", action="store_true",
+                        help="add a changes array to the success summary "
+                             "with one {record, column, before, after} "
+                             "entry per changed cell, in record order")
     return parser.parse_args(argv)
 
 
@@ -197,6 +205,7 @@ def main(argv=None):
     out_rows = [header]
     data_rows = 0
     changed_cells = 0
+    changes = []
     for record_no, record in records[1:]:
         if len(record) != expected_fields:
             fail(f"record {record_no} has {len(record)} field(s), "
@@ -208,6 +217,12 @@ def main(argv=None):
             fail(f"invalid date in column {args.column!r} "
                  f"at record {record_no}: {record[column_index]!r}")
         if cleaned != record[column_index]:
+            changes.append({
+                "record": record_no,
+                "column": args.column,
+                "before": record[column_index],
+                "after": cleaned,
+            })
             record[column_index] = cleaned
             changed_cells += 1
         out_rows.append(record)
@@ -225,7 +240,10 @@ def main(argv=None):
             pass
         fail(f"cannot write output file {args.output!r}: {exc}")
 
-    print(json.dumps({"rows": data_rows, "changed_cells": changed_cells}))
+    summary = {"rows": data_rows, "changed_cells": changed_cells}
+    if args.include_changes:
+        summary["changes"] = changes
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":
