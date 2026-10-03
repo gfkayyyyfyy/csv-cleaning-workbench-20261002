@@ -53,6 +53,14 @@ The tests exercise only the documented public CLI:
   with exit code 2, empty stdout and the documented reason on stderr;
   the existing target and the input keep their exact bytes and no extra
   files appear. A fresh output path still exports successfully.
+* file-access failures: a genuinely missing input path (output parent
+  present, output absent) and an output path whose parent directory does
+  not exist both fail with exit code 2, empty stdout and the fixed
+  stderr fragments "cannot read input file" / "cannot write output
+  file" (plus the file name) without a Python traceback; no output file
+  or missing directory is created, an existing input keeps its exact
+  bytes, and the shape is identical with and without --include-changes
+  (no summary or changes detail is ever printed on failure).
 """
 
 import codecs
@@ -1156,6 +1164,137 @@ class OutputPathProtectionTests(unittest.TestCase):
                 [HEADER, ["Alice", "x,y"]],
             )
         self.assertEqual(input_path.read_bytes(), input_bytes)
+
+
+class FileAccessFailureTests(unittest.TestCase):
+    """File-access failures: unreadable input and unwritable output paths.
+
+    Both failures must take the documented error shape -- exit code 2,
+    empty stdout, a reason on stderr containing the fixed fragments
+    "cannot read input file" / "cannot write output file" plus the file
+    name, and no Python traceback -- without creating the output file or
+    any missing directory, and without modifying an existing input file.
+    The scenarios use only genuinely missing paths inside a private
+    temporary directory, so they reproduce on Windows and common Unix
+    systems without relying on permission settings, disk capacity or
+    fixed absolute paths. Each run goes through the public CLI; internal
+    functions are never called and file operations are never replaced.
+    """
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.workspace = Path(self._tempdir.name)
+
+    def run_cleaner(self, input_path, output_path, *, include_changes):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "trim",
+        ]
+        if include_changes:
+            argv.append("--include-changes")
+        return subprocess.run(
+            argv, cwd=str(self.workspace), capture_output=True
+        )
+
+    def assert_access_failure(self, result, *, output_path, missing_dir,
+                              input_path, original_bytes, fragments):
+        """Assert the documented failure shape for a file-access error."""
+        self.assertEqual(result.returncode, 2)
+        # Empty stdout also means no success summary or changes detail.
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
+        for fragment in fragments:
+            self.assertIn(fragment, stderr_text)
+        # Only the fixed fragments are constrained; OS-specific error
+        # numbers and localized explanations are never compared.
+        self.assertNotIn("Traceback", stderr_text)
+        # A failed export leaves no output file behind...
+        self.assertFalse(
+            output_path.exists(),
+            "a failed run must not leave an output file behind",
+        )
+        # ...and must not create a directory that was missing beforehand
+        # (None means the output parent was expected to already exist).
+        if missing_dir is not None:
+            self.assertFalse(
+                missing_dir.exists(),
+                "a failed run must not create the missing output directory",
+            )
+        # An existing input is opened read-only: its exact bytes remain.
+        if input_path is not None:
+            self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_missing_input_file_fails_without_creating_output(self):
+        # The input path names a file that genuinely does not exist; the
+        # output parent exists and the output file does not. The failure
+        # is the input read, both with and without --include-changes.
+        input_path = self.workspace / "missing.csv"
+        output_path = self.workspace / "cleaned.csv"
+        self.assertFalse(input_path.exists())
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    include_changes=include_changes,
+                )
+
+                self.assert_access_failure(
+                    result,
+                    output_path=output_path,
+                    missing_dir=None,
+                    input_path=None,
+                    original_bytes=None,
+                    fragments=["cannot read input file", "missing.csv"],
+                )
+                # The missing input is never created as a side effect.
+                self.assertFalse(input_path.exists())
+                # Only the two paths named above are involved; the run
+                # must not leave any other file in the workspace either.
+                self.assertEqual(list(self.workspace.iterdir()), [])
+
+    def test_missing_output_directory_fails_without_creating_anything(self):
+        # A perfectly valid input whose name cell the trim rule would
+        # change (" Alice " -> "Alice"). The output parent directory does
+        # not exist, so writing must fail even though cleaning succeeds;
+        # neither the output file nor the missing directory may appear
+        # and the input bytes must stay unchanged.
+        input_bytes = encode_csv(
+            [HEADER, [" Alice ", "ok"]], bom=False
+        )
+        input_path = self.workspace / "input.csv"
+        input_path.write_bytes(input_bytes)
+        missing_dir = self.workspace / "no_such_dir"
+        output_path = missing_dir / "cleaned.csv"
+        self.assertFalse(missing_dir.exists())
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    include_changes=include_changes,
+                )
+
+                self.assert_access_failure(
+                    result,
+                    output_path=output_path,
+                    missing_dir=missing_dir,
+                    input_path=input_path,
+                    original_bytes=input_bytes,
+                    fragments=["cannot write output file", "cleaned.csv"],
+                )
+                # Only the original input file remains in the workspace.
+                self.assertEqual(
+                    sorted(p.name for p in self.workspace.iterdir()),
+                    ["input.csv"],
+                )
 
 
 class IncludeChangesCliTests(unittest.TestCase):
