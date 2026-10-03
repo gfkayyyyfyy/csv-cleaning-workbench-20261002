@@ -53,6 +53,15 @@ The tests exercise only the documented public CLI:
   with exit code 2, empty stdout and the documented reason on stderr;
   the existing target and the input keep their exact bytes and no extra
   files appear. A fresh output path still exports successfully.
+* --dry-run: the preview fully reads and validates the input and prints
+  the same summary (and changes detail with --include-changes) as a real
+  export, but creates neither the output file nor a missing parent
+  directory, and leaves the input bytes untouched. The preview keeps the
+  existing failure boundaries: a short record after a quoted-newline
+  record is still reported by CSV record number with empty stdout, and an
+  already-existing output file or an output path identical to the input
+  is still rejected, without a traceback, without new files and without
+  touching the input or the existing target.
 * local file access failures: a genuinely missing input file and an
   output path whose parent directory does not exist each fail with exit
   code 2, empty stdout and the categorized reason on stderr (no Python
@@ -1571,6 +1580,283 @@ class IncludeChangesCliTests(unittest.TestCase):
         )
         self.assertFalse(output_path.exists())
         self.assertEqual(input_path.read_bytes(), original_bytes)
+
+
+class DryRunCliTests(unittest.TestCase):
+    """Coverage for the --dry-run preview switch.
+
+    A dry run fully reads and validates the input and prints the same
+    summary JSON as a real export (plus the changes detail when
+    --include-changes is given), but writes nothing: no output file, no
+    missing parent directory, and the input bytes stay untouched. The
+    preview only skips the write step, so the documented failure
+    boundaries (record validation, output-path protection) still apply
+    with the exact same shape as for a real run.
+    """
+
+    # Four data records exercising the trim boundaries. Record 3's note
+    # carries a quoted real newline, so CSV record numbers (header is 1)
+    # diverge from physical line numbers; the notes also carry a comma
+    # and double quotes, which must survive untouched.
+    PREVIEW_ROWS = [
+        HEADER,
+        [" Alice ", "x,y"],           # record 2: trims to "Alice"
+        ["Bob", MULTILINE_NOTE],      # record 3: unchanged
+        ["   ", QUOTED_NOTE],         # record 4: whitespace-only -> ""
+        ["", "plain"],                # record 5: already empty, no change
+    ]
+    PREVIEW_EXPECTED_NAMES = ["Alice", "Bob", "", ""]
+    PREVIEW_EXPECTED_CHANGES = [
+        {"record": 2, "column": "name", "before": " Alice ",
+         "after": "Alice"},
+        {"record": 4, "column": "name", "before": "   ", "after": ""},
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, tag):
+        data = encode_csv(rows, bom=False)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, dry_run,
+                    include_changes=False, rule="trim", column="name"):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", column,
+            "--rule", rule,
+        ]
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def test_dry_run_summary_matches_real_export(self):
+        # The preview and the real export of the same input must report
+        # the identical summary, with and without --include-changes.
+        input_path, original_bytes = self.write_input(
+            self.PREVIEW_ROWS, tag="dry_summary"
+        )
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                tag = "with" if include_changes else "without"
+                preview_output = self.tmpdir / f"preview_{tag}.csv"
+                export_output = self.tmpdir / f"export_{tag}.csv"
+                self.assertFalse(preview_output.exists())
+                self.assertFalse(export_output.exists())
+
+                preview = self.run_cleaner(
+                    input_path, preview_output, dry_run=True,
+                    include_changes=include_changes,
+                )
+                self.assertEqual(preview.returncode, 0)
+                self.assertEqual(preview.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing non-whitespace.
+                preview_summary = json.loads(preview.stdout.decode("utf-8"))
+                expected_summary = {"rows": 4, "changed_cells": 2}
+                if include_changes:
+                    expected_summary["changes"] = (
+                        self.PREVIEW_EXPECTED_CHANGES
+                    )
+                self.assertEqual(preview_summary, expected_summary)
+                if include_changes:
+                    # Record numbers follow CSV records, not physical
+                    # lines: the quoted newline in record 3's note does
+                    # not shift the record 4 entry.
+                    self.assertEqual(
+                        [c["record"] for c in preview_summary["changes"]],
+                        [2, 4],
+                    )
+                    self.assertEqual(
+                        len(preview_summary["changes"]),
+                        preview_summary["changed_cells"],
+                    )
+                else:
+                    self.assertNotIn("changes", preview_summary)
+
+                # The preview created no output file and left the input
+                # byte-for-byte intact.
+                self.assertFalse(preview_output.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+                export = self.run_cleaner(
+                    input_path, export_output, dry_run=False,
+                    include_changes=include_changes,
+                )
+                self.assertEqual(export.returncode, 0)
+                self.assertEqual(export.stderr, b"")
+                # The real export prints the very same summary object.
+                self.assertEqual(
+                    json.loads(export.stdout.decode("utf-8")),
+                    preview_summary,
+                )
+                self.assertTrue(export_output.exists())
+                output_rows = self.read_output_records(export_output)
+                # Header and record order are unchanged; the name column
+                # follows trim semantics...
+                self.assertEqual(output_rows[0], HEADER)
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    self.PREVIEW_EXPECTED_NAMES,
+                )
+                # ...while the note column (comma, double quotes, real
+                # newline) round-trips untouched.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in self.PREVIEW_ROWS],
+                )
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_dry_run_succeeds_with_missing_output_parent_directory(self):
+        # A missing parent directory does not fail the preview, and the
+        # preview must not create the directory or the output file.
+        input_path, original_bytes = self.write_input(
+            self.PREVIEW_ROWS, tag="dry_missing_dir"
+        )
+        missing_dir = self.tmpdir / "nodir"
+        output_path = missing_dir / "cleaned.csv"
+        self.assertFalse(missing_dir.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(summary["rows"], 4)
+                self.assertEqual(summary["changed_cells"], 2)
+                # Neither the output file nor its parent directory may
+                # appear, and the input bytes stay untouched.
+                self.assertFalse(output_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_dry_run_header_only_file_reports_zero_counts(self):
+        input_path, original_bytes = self.write_input(
+            [HEADER], tag="dry_header_only"
+        )
+        output_path = self.tmpdir / "preview_header_only.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path, dry_run=True, include_changes=True
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 0, "changed_cells": 0, "changes": []},
+        )
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_dry_run_short_record_after_quoted_newline_fails(self):
+        # Record 3's note contains a quoted real newline, so it spans two
+        # physical lines but counts as one CSV record. Record 4 has only
+        # one field; the preview must report it by CSV record number and
+        # must not print the summary or changes detail it already
+        # computed for the earlier records.
+        rows = [
+            HEADER,
+            [" Alice ", "ok"],            # record 2: would trim
+            ["Bob", MULTILINE_NOTE],      # record 3: spans two lines
+            ["   "],                      # record 4: one field, expected 2
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, tag="dry_bad_record"
+        )
+        output_path = self.tmpdir / "preview_bad_record.csv"
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+                self.assertEqual(result.returncode, 2)
+                # Empty stdout also proves no summary or changes detail
+                # was printed for the records validated so far.
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("record 4", stderr_text)
+                self.assertIn("1 field(s)", stderr_text)
+                self.assertIn("expected 2", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_dry_run_rejects_existing_output_file(self):
+        # The path protection still applies in preview mode: an existing
+        # target is refused and keeps its exact bytes.
+        input_path, original_bytes = self.write_input(
+            self.PREVIEW_ROWS, tag="dry_existing"
+        )
+        output_path = self.tmpdir / "preview_existing.csv"
+        target_bytes = encode_csv([HEADER, ["keep", "me"]], bom=False)
+        output_path.write_bytes(target_bytes)
+
+        result = self.run_cleaner(input_path, output_path, dry_run=True)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        self.assertIn("output file already exists", stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+        # Target and input survive byte-for-byte, and no extra files
+        # appear in the workspace.
+        self.assertEqual(output_path.read_bytes(), target_bytes)
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()),
+            sorted([input_path.name, output_path.name]),
+        )
+
+    def test_dry_run_rejects_output_path_identical_to_input(self):
+        input_path, original_bytes = self.write_input(
+            self.PREVIEW_ROWS, tag="dry_same_path"
+        )
+
+        result = self.run_cleaner(input_path, input_path, dry_run=True)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        self.assertIn(
+            "output path must be different from the input path",
+            stderr_text,
+        )
+        self.assertNotIn("Traceback", stderr_text)
+        # The input is neither deleted nor rewritten, and nothing else
+        # appears in the workspace.
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+        self.assertEqual(
+            [p.name for p in self.tmpdir.iterdir()], [input_path.name]
+        )
 
 
 if __name__ == "__main__":
