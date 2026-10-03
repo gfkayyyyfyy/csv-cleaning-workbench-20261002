@@ -86,6 +86,22 @@ The tests exercise only the documented public CLI:
   traceback, no new files and byte-for-byte unchanged input and target
   files -- so --dry-run skips only the write step, never validation or
   path protection.
+* --dry-run preview of normalize-date: the due_date,note sample has four
+  records whose dates are " 29/02/2024 ", "2024-03-01", three spaces
+  and an empty string, with a quoted real newline inside the second
+  record's note. The preview exits 0 with empty stderr and a single
+  JSON object (rows 4, changed_cells 2) with and without
+  --include-changes; only records 2 and 4 are listed, with the
+  original whitespace in before and "2024-02-29" / "" after, and no
+  output file or other new file appears. A real export of the same
+  input prints the identical summary under each switch setting and
+  writes 2024-02-29 / 2024-03-01 / "" / "" with the note column,
+  header and record order preserved, while the preview path stays
+  absent. With 31/02/2024 at record 4 and NULL at record 5 the
+  preview fails with exit code 2, empty stdout and the first invalid
+  due_date value reported at record 4 (no Python traceback, no
+  summary or changes detail, no output file), and the input bytes
+  stay unchanged throughout.
 """
 
 import codecs
@@ -1936,6 +1952,235 @@ class DryRunCliTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr_text)
         self.assertEqual(input_path.read_bytes(), original_bytes)
         self.assert_workspace_holds_only([input_path.name])
+
+
+class DryRunNormalizeDateTests(unittest.TestCase):
+    """Coverage for --dry-run previews of the normalize-date rule.
+
+    The preview must run the full date conversion and validation and
+    print the same summary JSON as a real export (with and without
+    --include-changes) without creating the output file or any other
+    file, and an invalid date must fail the preview with the documented
+    record-numbered diagnostic instead of a summary. Everything goes
+    through the public CLI with small CSV files in a private temporary
+    directory; only the standard library is used.
+    """
+
+    # The shared DATE_ROWS sample is exactly the documented preview
+    # shape: due_date,note header plus four data records whose dates
+    # are " 29/02/2024 ", "2024-03-01", three plain spaces and an
+    # already-empty string, so only records 2 and 4 (the header is
+    # record 1) change. Record 3's note holds a quoted real newline,
+    # which must not disturb record numbering; the other notes carry a
+    # comma, double quotes and plain text, all outside the cleaned
+    # column.
+    PREVIEW_DATE_ROWS = DATE_ROWS
+    PREVIEW_DATE_CHANGES = [
+        {"record": 2, "column": "due_date",
+         "before": " 29/02/2024 ", "after": "2024-02-29"},
+        {"record": 4, "column": "due_date",
+         "before": "   ", "after": ""},
+    ]
+
+    # Same sample with the third date replaced by the impossible
+    # 31/02/2024 (record 4) and the fourth by the null-marker text NULL
+    # (record 5); the two leading legal records and the quoted-newline
+    # note are kept, so the first invalid value sits at record 4.
+    INVALID_PREVIEW_ROWS = [
+        DATE_HEADER,
+        [" 29/02/2024 ", "first, with comma"],
+        ["2024-03-01", '他说"好"\n第二行'],
+        ["31/02/2024", "plain"],
+        ["NULL", "last"],
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, tag):
+        data = encode_csv(rows, bom=False)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, dry_run,
+                    include_changes=False):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "due_date",
+            "--rule", "normalize-date",
+        ]
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def assert_workspace_holds_only(self, names):
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()), sorted(names)
+        )
+
+    def test_date_preview_summary_with_and_without_changes(self):
+        # Both preview modes exit 0 with empty stderr and exactly one
+        # JSON object on stdout: rows counts the four data records and
+        # changed_cells the two normalized cells. Without the switch
+        # there is no changes key; with it only records 2 and 4 appear,
+        # before keeping the original whitespace exactly and after
+        # holding "2024-02-29" / "" -- the quoted newline in record 3's
+        # note does not shift the record numbers.
+        input_path, original_bytes = self.write_input(
+            self.PREVIEW_DATE_ROWS, tag="date_preview"
+        )
+        output_path = self.tmpdir / "cleaned_date_preview.csv"
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing
+                # non-whitespace.
+                summary = json.loads(result.stdout.decode("utf-8"))
+                expected = {"rows": 4, "changed_cells": 2}
+                if include_changes:
+                    expected["changes"] = self.PREVIEW_DATE_CHANGES
+                self.assertEqual(summary, expected)
+                if include_changes:
+                    # One detail entry per changed cell, nothing more.
+                    self.assertEqual(
+                        len(summary["changes"]),
+                        summary["changed_cells"],
+                    )
+                else:
+                    self.assertNotIn("changes", summary)
+                # A successful preview writes nothing: no target file
+                # and no other new file, and the input keeps its exact
+                # bytes.
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+                self.assert_workspace_holds_only([input_path.name])
+
+    def test_date_preview_summary_matches_real_export(self):
+        # Under each --include-changes setting a real export of the same
+        # input prints the identical summary as the preview. The export
+        # writes 2024-02-29 / 2024-03-01 / "" / "" with the note column
+        # (comma, double quotes, embedded newline), the header and the
+        # record order preserved, while the preview path never appears
+        # on disk.
+        input_path, original_bytes = self.write_input(
+            self.PREVIEW_DATE_ROWS, tag="date_preview_vs_export"
+        )
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                tag = "with" if include_changes else "without"
+                preview_path = self.tmpdir / f"cleaned_preview_{tag}.csv"
+                export_path = self.tmpdir / f"cleaned_export_{tag}.csv"
+
+                preview = self.run_cleaner(
+                    input_path, preview_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+                export = self.run_cleaner(
+                    input_path, export_path, dry_run=False,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(preview.returncode, 0)
+                self.assertEqual(preview.stderr, b"")
+                self.assertEqual(export.returncode, 0)
+                self.assertEqual(export.stderr, b"")
+                # Same input and switches -> byte-identical summary.
+                self.assertEqual(preview.stdout, export.stdout)
+                summary = json.loads(export.stdout.decode("utf-8"))
+                self.assertEqual(summary["rows"], 4)
+                self.assertEqual(summary["changed_cells"], 2)
+
+                self.assertFalse(preview_path.exists())
+                self.assertTrue(export_path.exists())
+                self.assertFalse(
+                    export_path.read_bytes().startswith(codecs.BOM_UTF8)
+                )
+                output_rows = self.read_output_records(export_path)
+                # Header and record order are unchanged.
+                self.assertEqual(output_rows[0], DATE_HEADER)
+                self.assertEqual(len(output_rows), 5)
+                # The due_date column is normalized per row.
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    DATE_EXPECTED_DATES,
+                )
+                # The note column is never cleaned: commas, double
+                # quotes and the embedded newline round-trip exactly.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in self.PREVIEW_DATE_ROWS],
+                )
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        # Only the two export files were added next to the input.
+        self.assert_workspace_holds_only(
+            [input_path.name,
+             "cleaned_export_with.csv", "cleaned_export_without.csv"]
+        )
+
+    def test_date_preview_first_invalid_date_fails_by_record_number(self):
+        # Record 3's note contains a quoted real newline, so it spans
+        # two physical lines but counts as one CSV record. The first
+        # invalid date is 31/02/2024 at record 4; the NULL text at
+        # record 5 must never be reported because the run aborts at the
+        # first failure. With and without --include-changes the preview
+        # exits 2 with stdout exactly empty (so neither the
+        # already-computed summary nor any changes detail is printed),
+        # the diagnostic on stderr and no output file or other new file.
+        input_path, original_bytes = self.write_input(
+            self.INVALID_PREVIEW_ROWS, tag="date_preview_invalid"
+        )
+        output_path = self.tmpdir / "cleaned_date_preview_invalid.csv"
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 4", stderr_text)
+                # The message quotes the first offending value verbatim.
+                self.assertIn("31/02/2024", stderr_text)
+                # Only the first invalid date is reported; the later
+                # NULL record must not appear in the message.
+                self.assertNotIn("record 5", stderr_text)
+                self.assertNotIn("NULL", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+                self.assert_workspace_holds_only([input_path.name])
 
 
 if __name__ == "__main__":
