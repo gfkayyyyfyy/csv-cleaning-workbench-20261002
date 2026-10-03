@@ -102,6 +102,30 @@ The tests exercise only the documented public CLI:
   due_date value reported at record 4 (no Python traceback, no
   summary or changes detail, no output file), and the input bytes
   stay unchanged throughout.
+* --dry-run preview of normalize-null combined with --null-marker: the
+  BOM-prefixed UTF-8 sample has the name,note header and seven records
+  whose names are " MISSING ", " n/A ", three plain spaces, an empty
+  string, " NULLABLE ", " Ä " and "NuLl", with a quoted real newline in
+  the second record's note and commas, double quotes and plain text
+  across the other notes. The four custom markers MISSING, missing,
+  " n/A " and "ä" collapse to two effective keys (duplicate markers
+  never inflate the count). The preview exits 0 with empty stderr and a
+  single JSON object (rows 7, changed_cells 4); without
+  --include-changes there is no changes key, with it only records 2, 3,
+  4 and 8 appear in order (the header is record 1 and the quoted
+  newline does not advance the number), before keeping the original
+  values and after always "". The two unmatched values keep their
+  surrounding whitespace. The preview output path sits inside a
+  nonexistent parent directory and neither the file nor the directory
+  is created. A real export of the same input prints the identical
+  summary under each detail setting (compared by content, not key
+  order) and writes a BOM-free file with the expected name column and
+  the header, record order and note values preserved. A header-only
+  input with valid markers previews with both counts at 0 and an empty
+  changes array; a whitespace-only marker fails even on a header-only
+  input with exit code 2, empty stdout, the --null-marker / non-empty
+  reason on stderr, no Python traceback and no new files. The input
+  bytes stay unchanged throughout.
 """
 
 import codecs
@@ -2181,6 +2205,286 @@ class DryRunNormalizeDateTests(unittest.TestCase):
                 self.assertFalse(output_path.exists())
                 self.assertEqual(input_path.read_bytes(), original_bytes)
                 self.assert_workspace_holds_only([input_path.name])
+
+
+class DryRunNullMarkerTests(unittest.TestCase):
+    """Coverage for --dry-run previews of normalize-null with markers.
+
+    The repeatable --null-marker option and the --dry-run preview are
+    both documented public features; these tests pin their combination
+    end to end through the public CLI. The main sample is a BOM-prefixed
+    UTF-8 CSV whose name column exercises a custom marker with
+    surrounding whitespace, a default marker, a whitespace-only cell, an
+    already-empty cell, two near-miss values that must keep their
+    surrounding whitespace, and a mixed-case default NULL. The preview
+    prints the same summary JSON as a real export (with and without
+    --include-changes) while creating neither the output file nor its
+    missing parent directory, and a whitespace-only marker is rejected
+    even on a header-only input. Everything runs in a private temporary
+    directory using only the standard library.
+    """
+
+    # Four custom markers. "MISSING" and "missing" strip/lower to the
+    # same key, so they collapse into one effective marker and can never
+    # inflate the change count; " n/A " strips to the default N/A
+    # marker; "ä" only matches that exact lowercase spelling because
+    # case folding is ASCII-only (so " Ä " in the data is not a match).
+    PREVIEW_MARKERS = ["MISSING", "missing", " n/A ", "ä"]
+
+    # name,note header plus seven data records. The second record's
+    # note holds a quoted real newline, which must not disturb record
+    # numbering (the header is record 1); the other notes carry a
+    # comma, double quotes and plain text, all outside the cleaned
+    # column.
+    PREVIEW_NULL_ROWS = [
+        HEADER,
+        [" MISSING ", "plain text"],          # record 2: custom marker
+        [" n/A ", MULTILINE_NOTE],            # record 3: default marker
+        ["   ", "comma, inside"],             # record 4: whitespace-only
+        ["", QUOTED_NOTE],                    # record 5: already empty
+        [" NULLABLE ", "tail, with comma"],   # record 6: kept verbatim
+        [" Ä ", "plain"],                     # record 7: non-ASCII case
+        ["NuLl", 'she said "bye"'],           # record 8: default NULL
+    ]
+    # Records 2, 3, 4 and 8 become empty strings; record 5 was already
+    # empty (not counted as a change) and records 6 and 7 survive
+    # character-for-character including their surrounding spaces.
+    PREVIEW_EXPECTED_NAMES = [
+        "", "", "", "", " NULLABLE ", " Ä ", "",
+    ]
+    PREVIEW_EXPECTED_CHANGES = [
+        {"record": 2, "column": "name",
+         "before": " MISSING ", "after": ""},
+        {"record": 3, "column": "name",
+         "before": " n/A ", "after": ""},
+        {"record": 4, "column": "name",
+         "before": "   ", "after": ""},
+        {"record": 8, "column": "name",
+         "before": "NuLl", "after": ""},
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, tag, bom=True):
+        data = encode_csv(rows, bom=bom)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, dry_run,
+                    include_changes=False, markers=PREVIEW_MARKERS):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "normalize-null",
+        ]
+        for marker in markers:
+            argv.extend(["--null-marker", marker])
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def assert_workspace_holds_only(self, names):
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()), sorted(names)
+        )
+
+    def test_preview_summary_with_and_without_changes(self):
+        # The output path names a free file inside a directory that does
+        # not exist; the preview must still succeed and must create
+        # neither the file nor the missing directory. Without
+        # --include-changes the summary keeps its exact two-key shape;
+        # with it only records 2, 3, 4 and 8 are listed, in record
+        # order, each with the original value in before and "" after.
+        input_path, original_bytes = self.write_input(
+            self.PREVIEW_NULL_ROWS, tag="marker_preview"
+        )
+        # Pin the scenario precondition: the input really carries a BOM.
+        self.assertTrue(original_bytes.startswith(codecs.BOM_UTF8))
+        missing_dir = self.tmpdir / "nodir"
+        output_path = missing_dir / "cleaned.csv"
+        self.assertFalse(missing_dir.exists())
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing
+                # non-whitespace. Comparison is by parsed content, so
+                # key order is irrelevant.
+                summary = json.loads(result.stdout.decode("utf-8"))
+                expected = {"rows": 7, "changed_cells": 4}
+                if include_changes:
+                    expected["changes"] = self.PREVIEW_EXPECTED_CHANGES
+                self.assertEqual(summary, expected)
+                if include_changes:
+                    # One detail entry per changed cell, nothing more.
+                    self.assertEqual(
+                        len(summary["changes"]),
+                        summary["changed_cells"],
+                    )
+                else:
+                    self.assertNotIn("changes", summary)
+                # A successful preview writes nothing: no target file,
+                # no missing parent directory, and the input keeps its
+                # exact bytes.
+                self.assertFalse(output_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        self.assert_workspace_holds_only([input_path.name])
+
+    def test_export_summary_matches_preview(self):
+        # Under each --include-changes setting a real export of the same
+        # input prints the identical summary as the preview (compared by
+        # parsed content, not key order). The export is BOM-free, holds
+        # the expected name column, and preserves the header, the record
+        # order and every note value, while the preview path and its
+        # missing parent directory never appear on disk.
+        input_path, original_bytes = self.write_input(
+            self.PREVIEW_NULL_ROWS, tag="marker_preview_vs_export"
+        )
+        missing_dir = self.tmpdir / "nodir"
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                tag = "with" if include_changes else "without"
+                preview_path = missing_dir / f"preview_{tag}.csv"
+                export_path = self.tmpdir / f"cleaned_export_{tag}.csv"
+
+                preview = self.run_cleaner(
+                    input_path, preview_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+                export = self.run_cleaner(
+                    input_path, export_path, dry_run=False,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(preview.returncode, 0)
+                self.assertEqual(preview.stderr, b"")
+                self.assertEqual(export.returncode, 0)
+                self.assertEqual(export.stderr, b"")
+                # Same input and switches -> same summary content.
+                preview_summary = json.loads(preview.stdout.decode("utf-8"))
+                export_summary = json.loads(export.stdout.decode("utf-8"))
+                self.assertEqual(preview_summary, export_summary)
+                expected = {"rows": 7, "changed_cells": 4}
+                if include_changes:
+                    expected["changes"] = self.PREVIEW_EXPECTED_CHANGES
+                self.assertEqual(export_summary, expected)
+
+                self.assertFalse(preview_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertTrue(export_path.exists())
+                self.assertFalse(
+                    export_path.read_bytes().startswith(codecs.BOM_UTF8)
+                )
+                output_rows = self.read_output_records(export_path)
+                # Header and record order are unchanged.
+                self.assertEqual(output_rows[0], HEADER)
+                self.assertEqual(len(output_rows), 8)
+                # The name column follows the per-row expectations.
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    self.PREVIEW_EXPECTED_NAMES,
+                )
+                # The note column is never cleaned: the comma, double
+                # quotes, embedded newline and plain text round-trip
+                # exactly.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in self.PREVIEW_NULL_ROWS],
+                )
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        # Only the two export files were added next to the input.
+        self.assert_workspace_holds_only(
+            [input_path.name,
+             "cleaned_export_with.csv", "cleaned_export_without.csv"]
+        )
+
+    def test_preview_header_only_reports_zero_counts(self):
+        # A header-only input with valid markers previews successfully:
+        # both counts are 0, and with --include-changes the changes
+        # array is present and empty. No output file is created.
+        input_path, original_bytes = self.write_input(
+            [HEADER], tag="marker_preview_header_only"
+        )
+        output_path = self.tmpdir / "cleaned_marker_header_only.csv"
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                summary = json.loads(result.stdout.decode("utf-8"))
+                expected = {"rows": 0, "changed_cells": 0}
+                if include_changes:
+                    expected["changes"] = []
+                self.assertEqual(summary, expected)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        self.assert_workspace_holds_only([input_path.name])
+
+    def test_whitespace_only_marker_rejected_even_on_header_only(self):
+        # A marker that is empty after str.strip() is a parameter error,
+        # so it fails even when the header-only input would leave the
+        # marker nothing to match: exit 2, stdout exactly empty (no
+        # summary, no changes detail), the --null-marker / non-empty
+        # reason on stderr, no Python traceback and no new files.
+        input_path, original_bytes = self.write_input(
+            [HEADER], tag="marker_preview_blank"
+        )
+        output_path = self.tmpdir / "cleaned_marker_blank.csv"
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                    markers=["   "],
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("--null-marker", stderr_text)
+                self.assertIn("non-empty", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        self.assert_workspace_holds_only([input_path.name])
 
 
 if __name__ == "__main__":
