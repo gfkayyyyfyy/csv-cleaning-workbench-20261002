@@ -53,6 +53,16 @@ The tests exercise only the documented public CLI:
   with exit code 2, empty stdout and the documented reason on stderr;
   the existing target and the input keep their exact bytes and no extra
   files appear. A fresh output path still exports successfully.
+* local file access failures: a genuinely missing input file and an
+  output path whose parent directory does not exist each fail with exit
+  code 2, empty stdout and the categorized reason on stderr (no Python
+  traceback), both with and without --include-changes (so no summary or
+  changes detail is ever printed). The missing input is not created, no
+  output file or missing parent directory is created, and the input
+  bytes stay unchanged. Both cases run through the public CLI against
+  real absent paths inside private temporary directories, without
+  relying on permission settings, disk capacity or fixed absolute
+  paths, so they reproduce on Windows and common Unix-like systems.
 """
 
 import codecs
@@ -1156,6 +1166,179 @@ class OutputPathProtectionTests(unittest.TestCase):
                 [HEADER, ["Alice", "x,y"]],
             )
         self.assertEqual(input_path.read_bytes(), input_bytes)
+
+
+class FileAccessFailureTests(unittest.TestCase):
+    """Local file access failures promised by the README.
+
+    Two scenarios are exercised end to end through the public CLI only,
+    against real absent paths inside a private temporary directory:
+
+    * the input file does not exist (its parent does);
+    * the output file's parent directory does not exist.
+
+    Both must fail with exit code 2, empty stdout and the categorized
+    reason on stderr, without a Python traceback, with and without
+    --include-changes (so neither a summary nor a changes detail may be
+    printed), and without creating the missing input, any output file or
+    the missing directory; a readable input keeps its exact bytes. The
+    scenarios use ordinary missing paths rather than permission denial,
+    disk-full conditions or fixed absolute paths, so they reproduce on
+    Windows and common Unix-like systems with the standard library only.
+    """
+
+    # Valid UTF-8 CSV: documented header and one record whose name cell
+    # the trim rule does change, so a write failure cannot be blamed on
+    # there being nothing to clean.
+    CLEANABLE_INPUT_BYTES = b'name,note\n" Alice ",ok\n'
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def make_workspace(self, label):
+        """One fresh existing directory per (sub)test run."""
+        workspace = self.tmpdir / label
+        workspace.mkdir()
+        return workspace
+
+    def run_cleaner(self, input_path, output_path, *, include_changes):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "trim",
+        ]
+        if include_changes:
+            argv.append("--include-changes")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def assert_documented_failure(self, result, fragments):
+        """Exit 2, empty stdout, each fragment on stderr, no traceback.
+
+        Empty stdout is asserted byte-for-byte, which also proves that a
+        failure prints neither the success summary nor a changes array.
+        Only the fixed diagnostic fragments are constrained: the OS
+        error number and its possibly localized explanation are not.
+        """
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
+        for fragment in fragments:
+            self.assertIn(fragment, stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+
+    def test_missing_input_file_fails_before_anything_is_created(self):
+        # The input path names a genuinely absent file; the output goes
+        # to an existing parent directory under a name that is free.
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                label = "missing_input_with" if include_changes \
+                    else "missing_input_without"
+                workspace = self.make_workspace(label)
+                input_path = workspace / "missing.csv"
+                output_path = workspace / "cleaned.csv"
+                # Pin the scenario preconditions explicitly.
+                self.assertTrue(workspace.is_dir())
+                self.assertFalse(input_path.exists())
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    include_changes=include_changes,
+                )
+
+                self.assert_documented_failure(
+                    result, ["cannot read input file", "missing.csv"]
+                )
+                # The missing input must not be created, the output file
+                # must not appear, and nothing else may be left behind.
+                self.assertFalse(input_path.exists())
+                self.assertFalse(output_path.exists())
+                self.assertEqual(list(workspace.iterdir()), [])
+
+    def test_output_in_missing_directory_fails_without_creating_paths(self):
+        # The input is a valid UTF-8 CSV holding a record the trim rule
+        # would change; the output targets a free filename inside a
+        # directory that does not exist.
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                label = "missing_dir_with" if include_changes \
+                    else "missing_dir_without"
+                workspace = self.make_workspace(label)
+                input_path = workspace / "input.csv"
+                input_path.write_bytes(self.CLEANABLE_INPUT_BYTES)
+                missing_dir = workspace / "nodir"
+                output_path = missing_dir / "cleaned.csv"
+                # Pin the scenario preconditions explicitly.
+                self.assertFalse(missing_dir.exists())
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    include_changes=include_changes,
+                )
+
+                self.assert_documented_failure(
+                    result, ["cannot write output file", "cleaned.csv"]
+                )
+                # Neither the output file nor its missing parent
+                # directory may be created...
+                self.assertFalse(output_path.exists())
+                self.assertFalse(missing_dir.exists())
+                # ...the workspace contains only the untouched input...
+                self.assertEqual(
+                    sorted(p.name for p in workspace.iterdir()),
+                    ["input.csv"],
+                )
+                # ...whose bytes remain exactly as they were written.
+                self.assertEqual(
+                    input_path.read_bytes(), self.CLEANABLE_INPUT_BYTES
+                )
+
+    def test_same_cleanable_input_exports_into_existing_directory(self):
+        # Control for the write-failure scenario: the same valid input
+        # succeeds when its output directory already exists, exporting
+        # the header plus Alice,ok and the exact two-key summary, which
+        # proves the failure above is caused by the missing directory
+        # rather than by the input or arguments.
+        workspace = self.make_workspace("missing_dir_control")
+        input_path = workspace / "input.csv"
+        input_path.write_bytes(self.CLEANABLE_INPUT_BYTES)
+        output_path = workspace / "cleaned.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path, include_changes=False
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 1, "changed_cells": 1},
+        )
+        self.assertTrue(output_path.exists())
+        self.assertFalse(
+            output_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+        self.assertEqual(
+            self.read_output_records(output_path),
+            [HEADER, ["Alice", "ok"]],
+        )
+        self.assertEqual(
+            input_path.read_bytes(), self.CLEANABLE_INPUT_BYTES
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
 
 
 class IncludeChangesCliTests(unittest.TestCase):
