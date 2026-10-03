@@ -15,6 +15,12 @@ On success prints a single JSON object to stdout, e.g.
     {"rows": 3, "changed_cells": 2}
 and exits 0. Any failure exits 2 with the reason on stderr and no output
 file is created.
+
+With --include-changes the same JSON object gains a "changes" array
+listing every changed cell in record order, e.g.
+    {"rows": 3, "changed_cells": 2,
+     "changes": [{"record": 2, "column": "name",
+                  "before": " Alice ", "after": "Alice"}, ...]}
 """
 
 import argparse
@@ -121,6 +127,10 @@ def parse_args(argv):
     parser.add_argument("--rule", required=True,
                         help="cleaning rule to apply (supported: "
                              + ", ".join(sorted(RULES)) + ")")
+    parser.add_argument("--include-changes", action="store_true",
+                        help="add a \"changes\" array to the success "
+                             "summary, one entry per changed cell with "
+                             "record, column, before and after")
     parser.add_argument("--null-marker", action="append", default=[],
                         metavar="MARKER",
                         help="additional whole-value null marker for "
@@ -197,19 +207,23 @@ def main(argv=None):
     out_rows = [header]
     data_rows = 0
     changed_cells = 0
+    changes = []
     for record_no, record in records[1:]:
         if len(record) != expected_fields:
             fail(f"record {record_no} has {len(record)} field(s), "
                  f"expected {expected_fields}")
         record = list(record)
+        before = record[column_index]
         try:
-            cleaned = rule(record[column_index])
+            cleaned = rule(before)
         except InvalidDateError:
             fail(f"invalid date in column {args.column!r} "
-                 f"at record {record_no}: {record[column_index]!r}")
-        if cleaned != record[column_index]:
+                 f"at record {record_no}: {before!r}")
+        if cleaned != before:
             record[column_index] = cleaned
             changed_cells += 1
+            changes.append({"record": record_no, "column": args.column,
+                            "before": before, "after": cleaned})
         out_rows.append(record)
         data_rows += 1
 
@@ -225,7 +239,10 @@ def main(argv=None):
             pass
         fail(f"cannot write output file {args.output!r}: {exc}")
 
-    print(json.dumps({"rows": data_rows, "changed_cells": changed_cells}))
+    summary = {"rows": data_rows, "changed_cells": changed_cells}
+    if args.include_changes:
+        summary["changes"] = changes
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":
