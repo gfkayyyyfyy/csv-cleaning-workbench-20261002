@@ -19,6 +19,13 @@ file is created.
 With --include-changes the same JSON object gains a "changes" array with
 one {"record", "column", "before", "after"} entry per changed cell, in
 record order; no separate detail file is written.
+
+With --dry-run the input is fully read and validated and the same summary
+JSON is printed, but no output file or directory is created. The output
+path must still differ from the input and must not already exist; a
+missing parent directory or unwritable location does not fail the
+preview, so a successful dry run does not guarantee a real export would
+succeed.
 """
 
 import argparse
@@ -135,6 +142,10 @@ def parse_args(argv):
                         help="add a changes array to the success summary "
                              "with one {record, column, before, after} "
                              "entry per changed cell, in record order")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="preview only: fully read and validate the "
+                             "input and print the same summary JSON, but "
+                             "create no output file or directory")
     return parser.parse_args(argv)
 
 
@@ -228,17 +239,18 @@ def main(argv=None):
         out_rows.append(record)
         data_rows += 1
 
-    try:
-        with open(args.output, "x", encoding="utf-8", newline="") as outfile:
-            csv.writer(outfile).writerows(out_rows)
-    except FileExistsError:
-        fail(f"output file already exists: {args.output!r}")
-    except OSError as exc:
+    if not args.dry_run:
         try:
-            os.unlink(args.output)
-        except OSError:
-            pass
-        fail(f"cannot write output file {args.output!r}: {exc}")
+            with open(args.output, "x", encoding="utf-8", newline="") as outfile:
+                csv.writer(outfile).writerows(out_rows)
+        except FileExistsError:
+            fail(f"output file already exists: {args.output!r}")
+        except OSError as exc:
+            try:
+                os.unlink(args.output)
+            except OSError:
+                pass
+            fail(f"cannot write output file {args.output!r}: {exc}")
 
     summary = {"rows": data_rows, "changed_cells": changed_cells}
     if args.include_changes:
