@@ -202,6 +202,24 @@ The tests exercise only the documented public CLI:
   1) with name changing from " Alice " to "Alice", and a BOM-free
   UTF-8 export whose header and note value are preserved while the
   input stays byte-for-byte untouched.
+* empty physical lines versus empty fields: with the name,note header,
+  a completely empty physical line after a quoted two-line record is
+  CSV record 3 with zero fields and fails both the export and the
+  --dry-run preview with exit code 2, empty stdout and "record 3 ...
+  0 field(s) ... expected 2" on stderr, leaving no cleaned Alice row,
+  no output file and byte-for-byte untouched input; a leading empty
+  physical line fails as "input is empty: no header record" in both
+  modes even though a normal header follows. The success control keeps
+  a quoted note holding two consecutive real newlines (the blank
+  physical line belongs to the note) and a comma-only record (two
+  empty fields): both modes exit 0 with empty stderr, rows 3 /
+  changed_cells 1 and a single changes entry for record 2
+  (" Alice " -> "Alice"); the export preserves all three records and
+  the note's real newlines as BOM-free UTF-8 while the preview prints
+  the identical JSON content without creating the target file or its
+  missing parent directory. Every sample runs with LF and CRLF record
+  separators and with and without a UTF-8 BOM, compared by parsed
+  fields and JSON content rather than quoting style or key order.
 """
 
 import codecs
@@ -3737,5 +3755,275 @@ class NormalizeWhitespaceCliTests(unittest.TestCase):
         )
 
 
+class EmptyLineBoundaryTests(unittest.TestCase):
+    """Regression tests for empty physical lines versus empty fields.
+
+    All samples use the name,note header and go through the public CLI
+    with --rule trim on the name column and --include-changes, in both
+    the real export and the --dry-run preview mode. The failure samples
+    pin two boundaries: a completely empty physical line between records
+    is a CSV record with zero fields (rejected by record number), and a
+    leading empty physical line means there is no header record at all.
+    The success control pins that a blank physical line inside a quoted
+    note and a comma-only record (two empty fields) are data, not
+    errors. Each sample runs with LF and CRLF record separators and
+    with and without a UTF-8 BOM; results are compared by parsed fields
+    and JSON content, never by quoting style or JSON key order. Only
+    the standard library is used and every file lives inside a private
+    temporary directory that is removed afterwards.
+    """
+
+    NEWLINES = ("\n", "\r\n")
+    BOM_VARIANTS = (False, True)
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def variants(self):
+        for newline in self.NEWLINES:
+            for bom in self.BOM_VARIANTS:
+                yield newline, bom
+
+    @staticmethod
+    def encode_raw(body, *, bom):
+        data = body.encode("utf-8")
+        return codecs.BOM_UTF8 + data if bom else data
+
+    def make_workdir(self, tag):
+        # Each subTest gets its own directory so the workspace listing
+        # pins exactly the files that one run created.
+        workdir = self.tmpdir / tag
+        workdir.mkdir()
+        return workdir
+
+    def write_raw_input(self, workdir, data):
+        path = workdir / "input.csv"
+        path.write_bytes(data)
+        return path
+
+    def run_cleaner(self, input_path, output_path, *, dry_run):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "trim",
+            "--include-changes",
+        ]
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def assert_workspace_holds_only(self, workdir, names):
+        self.assertEqual(
+            sorted(p.name for p in workdir.iterdir()), sorted(names)
+        )
+
+    @staticmethod
+    def success_body(newline):
+        # Record 2's quoted note holds two consecutive real newlines, so
+        # the blank physical line between "first" and "second" belongs
+        # to the note. Record 3 is a lone comma: two empty fields.
+        return newline.join([
+            "name,note",
+            '" Alice ","first',
+            "",
+            'second"',
+            ",",
+            "Bob,z",
+            "",
+        ])
+
+    @staticmethod
+    def blank_record_body(newline):
+        # The completely empty physical line after the quoted two-line
+        # record is CSV record 3 and parses to zero fields.
+        return newline.join([
+            "name,note",
+            '" Alice ","two',
+            'lines"',
+            "",
+            "Bob,z",
+            "",
+        ])
+
+    @staticmethod
+    def leading_blank_body(newline):
+        # A completely empty physical line before the header leaves the
+        # file without a header record.
+        return newline.join([
+            "",
+            "name,note",
+            "Bob,z",
+            "",
+        ])
+
+    def test_empty_physical_line_fails_as_zero_field_record_3(self):
+        # The empty physical line after the quoted two-line record is
+        # CSV record 3 with zero fields, so both modes fail before any
+        # cleaned Alice row or output file can be produced.
+        for index, (newline, bom) in enumerate(self.variants()):
+            for dry_run in (False, True):
+                with self.subTest(newline=repr(newline), bom=bom,
+                                  dry_run=dry_run):
+                    tag = (f"blankrec_{index}_"
+                           f"{'dry' if dry_run else 'export'}")
+                    workdir = self.make_workdir(tag)
+                    original_bytes = self.encode_raw(
+                        self.blank_record_body(newline), bom=bom
+                    )
+                    input_path = self.write_raw_input(
+                        workdir, original_bytes
+                    )
+                    output_path = workdir / "cleaned.csv"
+                    self.assertFalse(output_path.exists())
+
+                    result = self.run_cleaner(
+                        input_path, output_path, dry_run=dry_run
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b"")
+                    stderr_text = result.stderr.decode("utf-8")
+                    for fragment in ("record 3", "0 field(s)",
+                                     "expected 2"):
+                        self.assertIn(fragment, stderr_text)
+                    self.assertNotIn("Traceback", stderr_text)
+                    self.assertFalse(output_path.exists())
+                    self.assertEqual(
+                        input_path.read_bytes(), original_bytes
+                    )
+                    self.assert_workspace_holds_only(
+                        workdir, [input_path.name]
+                    )
+
+    def test_leading_empty_line_fails_as_missing_header(self):
+        # Even though a normal header follows, the leading empty
+        # physical line is record 1 with zero fields, so the input has
+        # no header record and both modes fail.
+        for index, (newline, bom) in enumerate(self.variants()):
+            for dry_run in (False, True):
+                with self.subTest(newline=repr(newline), bom=bom,
+                                  dry_run=dry_run):
+                    tag = (f"leadblank_{index}_"
+                           f"{'dry' if dry_run else 'export'}")
+                    workdir = self.make_workdir(tag)
+                    original_bytes = self.encode_raw(
+                        self.leading_blank_body(newline), bom=bom
+                    )
+                    input_path = self.write_raw_input(
+                        workdir, original_bytes
+                    )
+                    output_path = workdir / "cleaned.csv"
+                    self.assertFalse(output_path.exists())
+
+                    result = self.run_cleaner(
+                        input_path, output_path, dry_run=dry_run
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b"")
+                    stderr_text = result.stderr.decode("utf-8")
+                    for fragment in ("input is empty",
+                                     "no header record"):
+                        self.assertIn(fragment, stderr_text)
+                    self.assertNotIn("Traceback", stderr_text)
+                    self.assertFalse(output_path.exists())
+                    self.assertEqual(
+                        input_path.read_bytes(), original_bytes
+                    )
+                    self.assert_workspace_holds_only(
+                        workdir, [input_path.name]
+                    )
+
+    def test_quoted_blank_line_and_empty_fields_are_kept(self):
+        # The blank physical line inside the quoted note and the
+        # comma-only record (two empty fields) are data: both modes
+        # accept all three records, and only record 2's name changes.
+        for index, (newline, bom) in enumerate(self.variants()):
+            note = f"first{newline}{newline}second"
+            expected_summary = {
+                "rows": 3,
+                "changed_cells": 1,
+                "changes": [
+                    {"record": 2, "column": "name",
+                     "before": " Alice ", "after": "Alice"},
+                ],
+            }
+            expected_records = [
+                HEADER,
+                ["Alice", note],
+                ["", ""],
+                ["Bob", "z"],
+            ]
+            for dry_run in (False, True):
+                with self.subTest(newline=repr(newline), bom=bom,
+                                  dry_run=dry_run):
+                    tag = (f"ok_{index}_"
+                           f"{'dry' if dry_run else 'export'}")
+                    workdir = self.make_workdir(tag)
+                    original_bytes = self.encode_raw(
+                        self.success_body(newline), bom=bom
+                    )
+                    input_path = self.write_raw_input(
+                        workdir, original_bytes
+                    )
+                    if dry_run:
+                        # The preview must not create the target file
+                        # or its missing parent directory.
+                        output_path = workdir / "missing" / "cleaned.csv"
+                    else:
+                        output_path = workdir / "cleaned.csv"
+                    self.assertFalse(output_path.exists())
+
+                    result = self.run_cleaner(
+                        input_path, output_path, dry_run=dry_run
+                    )
+
+                    self.assertEqual(result.returncode, 0)
+                    self.assertEqual(result.stderr, b"")
+                    # stdout must consist of exactly one JSON object and
+                    # nothing else; dict comparison ignores key order.
+                    summary = json.loads(result.stdout.decode("utf-8"))
+                    self.assertEqual(summary, expected_summary)
+
+                    if dry_run:
+                        self.assertFalse(output_path.exists())
+                        self.assertFalse(output_path.parent.exists())
+                        self.assert_workspace_holds_only(
+                            workdir, [input_path.name]
+                        )
+                    else:
+                        self.assertTrue(output_path.exists())
+                        raw_output = output_path.read_bytes()
+                        self.assertFalse(
+                            raw_output.startswith(codecs.BOM_UTF8)
+                        )
+                        # Parsed contents must match regardless of the
+                        # quoting style or line terminator used by the
+                        # equivalent output CSV.
+                        self.assertEqual(
+                            self.read_output_records(output_path),
+                            expected_records,
+                        )
+                        self.assert_workspace_holds_only(
+                            workdir, [input_path.name, output_path.name]
+                        )
+                    self.assertEqual(
+                        input_path.read_bytes(), original_bytes
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
+
