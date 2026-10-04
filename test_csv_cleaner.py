@@ -122,6 +122,25 @@ The tests exercise only the documented public CLI:
   due_date value reported at record 4 (no Python traceback, no
   summary or changes detail, no output file), and the input bytes
   stay unchanged throughout.
+* --dry-run preview combined with --date-order: the due_date,note
+  sample has four records dated 05/06/2024 (its note holds a quoted
+  real newline), 2024/02/29, 2024-01-01 and an empty string. A preview
+  reads the ambiguous year-last slash date as 2024-05-06 under mdy and
+  as 2024-06-05 under dmy or with the option omitted; in all three
+  cases the preview exits 0 with empty stderr and rows 4 /
+  changed_cells 2, with and without --include-changes (without the
+  switch there is no changes key, with it only records 2 and 3 appear
+  in record order with accurate before/after values). The preview JSON
+  equals a real export's by parsed content, and the export keeps the
+  header, the notes (including the quoted newline) and the record
+  order while writing into a separate fresh path; an output path under
+  a missing parent directory still previews successfully without
+  creating that directory. A second file follows 05/06/2024 with
+  13/02/2024 and 02/30/2024: under mdy the preview exits 2 with empty
+  stdout and a diagnostic naming due_date, record 3 and the original
+  13/02/2024 value, with no Python traceback and no mention of the
+  later record, both with and without details. Every preview leaves
+  the input bytes untouched and creates no output or other new file.
 * --dry-run preview of normalize-null combined with --null-marker: the
   BOM-prefixed UTF-8 sample has the name,note header and seven records
   whose names are " MISSING ", " n/A ", three plain spaces, an empty
@@ -3110,6 +3129,310 @@ class DateOrderCliTests(unittest.TestCase):
         self.assertEqual(
             self.read_output_records(output_path), [DATE_HEADER]
         )
+
+
+class DryRunDateOrderTests(unittest.TestCase):
+    """Regression coverage for --dry-run combined with --date-order.
+
+    The two switches were tested separately (ordered real exports and
+    default-order previews); these tests pin their combined existing
+    behavior: the preview runs the full order-dependent date
+    conversion and validation and prints the same summary JSON as a
+    real export (with and without --include-changes), but creates no
+    output file, missing parent directory or other new file and leaves
+    the input bytes untouched. Everything goes through the documented
+    public CLI with small UTF-8 CSV files in a private temporary
+    directory; results are judged on parsed CSV fields and the parsed
+    JSON object, so equivalent quoting styles and JSON key order are
+    irrelevant.
+    """
+
+    # due_date,note with four data records: the ambiguous year-last
+    # slash date first (its note carries a quoted real newline, which
+    # must not shift record numbers), then the YYYY/MM/DD leap day, an
+    # already-ISO date and an already-empty cell. Only records 2 and 3
+    # (the header is record 1) change under either order.
+    ORDER_PREVIEW_ROWS = [
+        DATE_HEADER,
+        ["05/06/2024", '他说"好"\n第二行'],   # 05-06 under mdy / 06-05 under dmy
+        ["2024/02/29", "second, note"],      # YYYY/MM/DD -> 2024-02-29 either way
+        ["2024-01-01", "third"],             # already ISO: not a change
+        ["", "fourth"],                      # already empty: not a change
+    ]
+    ORDER_PREVIEW_DATES_MDY = [
+        "2024-05-06", "2024-02-29", "2024-01-01", "",
+    ]
+    ORDER_PREVIEW_DATES_DMY = [
+        "2024-06-05", "2024-02-29", "2024-01-01", "",
+    ]
+
+    @staticmethod
+    def expected_changes(first_after):
+        return [
+            {"record": 2, "column": "due_date",
+             "before": "05/06/2024", "after": first_after},
+            {"record": 3, "column": "due_date",
+             "before": "2024/02/29", "after": "2024-02-29"},
+        ]
+
+    # A file whose first data date is legal under mdy and whose note
+    # again spans a quoted newline, followed by 13/02/2024 (month 13
+    # under mdy) at record 3 and 02/30/2024 (February 30 under mdy) at
+    # record 4: only the first invalid date may be reported.
+    ORDER_INVALID_ROWS = [
+        DATE_HEADER,
+        ["05/06/2024", '他说"好"\n第二行'],
+        ["13/02/2024", "candidate"],
+        ["02/30/2024", "later, never reached"],
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, tag):
+        data = encode_csv(rows, bom=False)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, order="OMITTED",
+                    dry_run, include_changes=False):
+        # order="OMITTED" means --date-order is not passed at all, so
+        # the documented dmy default applies.
+        argv = [
+            sys.executable, str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "due_date",
+            "--rule", "normalize-date",
+        ]
+        if order != "OMITTED":
+            argv.extend(["--date-order", order])
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def assert_workspace_holds_only(self, names):
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()), sorted(names)
+        )
+
+    def test_preview_order_summary_and_changes(self):
+        # mdy previews normalize 05/06/2024 to 2024-05-06; explicit dmy
+        # and omitting the option both give 2024-06-05. In all three
+        # cases the preview exits 0 with empty stderr and rows 4 /
+        # changed_cells 2. Without --include-changes there is no
+        # changes key; with it only records 2 and 3 appear, in record
+        # order, with accurate column, before and after values. Every
+        # preview leaves the input bytes untouched and creates neither
+        # the output file nor any other file.
+        scenarios = [
+            ("mdy", "mdy", "2024-05-06"),
+            ("dmy", "dmy", "2024-06-05"),
+            ("omitted", "OMITTED", "2024-06-05"),
+        ]
+        expected_workspace = []
+        for tag, order, first_after in scenarios:
+            input_path, original_bytes = self.write_input(
+                self.ORDER_PREVIEW_ROWS, tag=f"order_preview_{tag}"
+            )
+            expected_workspace.append(input_path.name)
+            output_path = self.tmpdir / f"cleaned_preview_{tag}.csv"
+            self.assertFalse(output_path.exists())
+
+            for include_changes in (False, True):
+                with self.subTest(order=tag, include_changes=include_changes):
+                    result = self.run_cleaner(
+                        input_path, output_path, order=order, dry_run=True,
+                        include_changes=include_changes,
+                    )
+
+                    self.assertEqual(result.returncode, 0)
+                    self.assertEqual(result.stderr, b"")
+                    # Exactly one JSON object: json.loads rejects
+                    # trailing non-whitespace.
+                    summary = json.loads(result.stdout.decode("utf-8"))
+                    expected = {"rows": 4, "changed_cells": 2}
+                    if include_changes:
+                        expected["changes"] = self.expected_changes(first_after)
+                    self.assertEqual(summary, expected)
+                    if include_changes:
+                        self.assertEqual(
+                            len(summary["changes"]),
+                            summary["changed_cells"],
+                        )
+                    else:
+                        self.assertNotIn("changes", summary)
+                    self.assertFalse(output_path.exists())
+                    self.assertEqual(input_path.read_bytes(), original_bytes)
+
+            self.assert_workspace_holds_only(expected_workspace)
+
+    def test_preview_json_matches_real_export_under_each_order(self):
+        # With identical cleaning parameters the preview and a real
+        # export into a separate fresh path print the same JSON content
+        # (compared parsed, not by key order) under both detail
+        # settings. The export preserves the header, every note
+        # (including the quoted real newline, comma and quotes) and the
+        # record order; the preview path never appears.
+        for tag, order, expected_dates in (
+            ("mdy", "mdy", self.ORDER_PREVIEW_DATES_MDY),
+            ("dmy", "dmy", self.ORDER_PREVIEW_DATES_DMY),
+        ):
+            input_path, original_bytes = self.write_input(
+                self.ORDER_PREVIEW_ROWS, tag=f"order_preview_export_{tag}"
+            )
+
+            for include_changes in (False, True):
+                with self.subTest(order=tag, include_changes=include_changes):
+                    detail = "with" if include_changes else "without"
+                    preview_path = self.tmpdir / (
+                        f"cleaned_preview_{tag}_{detail}.csv"
+                    )
+                    export_path = self.tmpdir / (
+                        f"cleaned_export_{tag}_{detail}.csv"
+                    )
+
+                    preview = self.run_cleaner(
+                        input_path, preview_path, order=order, dry_run=True,
+                        include_changes=include_changes,
+                    )
+                    export = self.run_cleaner(
+                        input_path, export_path, order=order, dry_run=False,
+                        include_changes=include_changes,
+                    )
+
+                    self.assertEqual(preview.returncode, 0)
+                    self.assertEqual(preview.stderr, b"")
+                    self.assertEqual(export.returncode, 0)
+                    self.assertEqual(export.stderr, b"")
+                    self.assertEqual(
+                        json.loads(preview.stdout.decode("utf-8")),
+                        json.loads(export.stdout.decode("utf-8")),
+                    )
+                    summary = json.loads(export.stdout.decode("utf-8"))
+                    self.assertEqual(summary["rows"], 4)
+                    self.assertEqual(summary["changed_cells"], 2)
+
+                    self.assertFalse(preview_path.exists())
+                    self.assertTrue(export_path.exists())
+                    self.assertFalse(
+                        export_path.read_bytes().startswith(codecs.BOM_UTF8)
+                    )
+                    output_rows = self.read_output_records(export_path)
+                    self.assertEqual(output_rows[0], DATE_HEADER)
+                    self.assertEqual(len(output_rows), 5)
+                    self.assertEqual(
+                        [row[0] for row in output_rows[1:]], expected_dates
+                    )
+                    # The note column, header and record order stay as
+                    # in the input; the quoted newline round-trips.
+                    self.assertEqual(
+                        [row[1] for row in output_rows],
+                        [row[1] for row in self.ORDER_PREVIEW_ROWS],
+                    )
+                    self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        # Only the four export files were added next to the two inputs.
+        self.assert_workspace_holds_only([
+            "input_order_preview_export_dmy.csv",
+            "input_order_preview_export_mdy.csv",
+            "cleaned_export_dmy_with.csv",
+            "cleaned_export_dmy_without.csv",
+            "cleaned_export_mdy_with.csv",
+            "cleaned_export_mdy_without.csv",
+        ])
+
+    def test_preview_succeeds_with_output_parent_missing(self):
+        # A successful preview must not depend on the output location:
+        # the path sits under a nonexistent directory, yet the preview
+        # exits 0 and neither the file nor the missing directory is
+        # created, for either order and either detail setting.
+        expected_workspace = []
+        for tag, order in (("mdy", "mdy"), ("omitted", "OMITTED")):
+            input_path, original_bytes = self.write_input(
+                self.ORDER_PREVIEW_ROWS, tag=f"order_preview_missing_dir_{tag}"
+            )
+            expected_workspace.append(input_path.name)
+            missing_parent = self.tmpdir / f"no_such_dir_{tag}"
+            output_path = missing_parent / "cleaned_preview.csv"
+            self.assertFalse(missing_parent.exists())
+
+            for include_changes in (False, True):
+                with self.subTest(order=tag, include_changes=include_changes):
+                    result = self.run_cleaner(
+                        input_path, output_path, order=order, dry_run=True,
+                        include_changes=include_changes,
+                    )
+
+                    self.assertEqual(result.returncode, 0)
+                    self.assertEqual(result.stderr, b"")
+                    summary = json.loads(result.stdout.decode("utf-8"))
+                    self.assertEqual(
+                        summary,
+                        {"rows": 4, "changed_cells": 2}
+                        if not include_changes
+                        else {"rows": 4, "changed_cells": 2,
+                              "changes": self.expected_changes(
+                                  "2024-05-06" if order == "mdy"
+                                  else "2024-06-05"
+                              )},
+                    )
+                    self.assertFalse(missing_parent.exists())
+                    self.assertFalse(output_path.exists())
+                    self.assertEqual(input_path.read_bytes(), original_bytes)
+
+            self.assert_workspace_holds_only(expected_workspace)
+
+    def test_mdy_preview_still_validates_dates_and_reports_first_only(self):
+        # Choosing an order must not bypass date validation in a
+        # preview. Record 2's note spans a quoted real newline but
+        # counts as one CSV record, so 13/02/2024 sits at record 3:
+        # under mdy it is month 13. With and without --include-changes
+        # the preview exits 2 with stdout exactly empty (no summary or
+        # changes detail) and stderr naming the column, record 3 and
+        # the original value; the later 02/30/2024 is never reported,
+        # no Python traceback appears, and no output or other file is
+        # created.
+        input_path, original_bytes = self.write_input(
+            self.ORDER_INVALID_ROWS, tag="order_preview_invalid"
+        )
+        output_path = self.tmpdir / "cleaned_order_preview_invalid.csv"
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, order="mdy", dry_run=True,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 3", stderr_text)
+                self.assertIn("13/02/2024", stderr_text)
+                # Only the first invalid date is reported; record 4's
+                # value must not surface anywhere in the message.
+                self.assertNotIn("record 4", stderr_text)
+                self.assertNotIn("02/30/2024", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+                self.assert_workspace_holds_only([input_path.name])
 
 
 if __name__ == "__main__":
