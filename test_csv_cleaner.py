@@ -128,6 +128,25 @@ The tests exercise only the documented public CLI:
   input with exit code 2, empty stdout, the --null-marker / non-empty
   reason on stderr, no Python traceback and no new files. The input
   bytes stay unchanged throughout.
+* command-line argument validation: one legal UTF-8 sample (header
+  name,note, a single record whose name parses as " Alice " and whose
+  note parses as "x,y") isolates the argument errors. Removing any one
+  of --input, --output, --column or --rule from an otherwise valid
+  call, or naming a rule the tool does not support ("unknown-rule", or
+  "Trim" with a capital T, since rule names are case-sensitive), fails
+  with exit code 2, a byte-for-byte empty stdout (checked for the
+  unknown rules with and without --include-changes, so neither the
+  summary nor a changes array is ever printed), the omitted option
+  name or the unsupported-rule reason with the passed value on stderr,
+  and no Python traceback. The input bytes stay unchanged, the
+  designated output never appears (with --output omitted no implicit
+  output is generated either) and the temporary directory gains no new
+  files. A valid trim call with --include-changes on the same input is
+  the success control: exit 0, empty stderr, rows and changed_cells
+  both 1, a changes array holding only record 2 (the header is record
+  1) with name changing from " Alice " to "Alice", and a BOM-free
+  UTF-8 export whose header and note value are preserved while the
+  input stays byte-for-byte untouched.
 """
 
 import codecs
@@ -2675,6 +2694,144 @@ class DryRunNullMarkerTests(unittest.TestCase):
                 self.assertEqual(input_path.read_bytes(), original_bytes)
 
         self.assert_workspace_holds_only([input_path.name])
+
+
+class ArgumentValidationTests(unittest.TestCase):
+    """Required-option and unsupported-rule rejection via the public CLI.
+
+    A single legal UTF-8 sample -- header name,note plus one record
+    whose name parses as " Alice " and whose note parses as "x,y" --
+    isolates the argument errors from any data problem: every failure
+    below runs against input the tool would otherwise clean happily.
+    """
+
+    # The note carries a comma so it must stay quoted; the name carries
+    # surrounding spaces so trim has exactly one cell to change.
+    INPUT_BYTES = b'name,note\n" Alice ","x,y"\n'
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+        self.input_path = self.tmpdir / "input.csv"
+        self.input_path.write_bytes(self.INPUT_BYTES)
+        # The designated output is a fresh name next to the input.
+        self.output_path = self.tmpdir / "cleaned.csv"
+
+    def valid_args(self):
+        """The four required options, all valid for the sample input."""
+        return [
+            "--input", str(self.input_path),
+            "--output", str(self.output_path),
+            "--column", "name",
+            "--rule", "trim",
+        ]
+
+    def run_cleaner(self, args):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), *args],
+            cwd=str(self.tmpdir), capture_output=True,
+        )
+
+    def assert_no_side_effects(self):
+        """Input bytes intact, no output file, no new files at all.
+
+        With --output omitted this also proves no implicit output is
+        generated anywhere in the directory.
+        """
+        self.assertEqual(self.input_path.read_bytes(), self.INPUT_BYTES)
+        self.assertFalse(self.output_path.exists())
+        self.assertEqual(
+            [p.name for p in self.tmpdir.iterdir()], ["input.csv"]
+        )
+
+    def test_missing_required_option_is_rejected(self):
+        # Dropping any one of the four required options from an
+        # otherwise valid call must exit 2 with a byte-for-byte empty
+        # stdout and the omitted option name on stderr, without a
+        # Python traceback; the usage text itself, its punctuation and
+        # the argument order are deliberately not pinned.
+        for option in ("--input", "--output", "--column", "--rule"):
+            with self.subTest(missing=option):
+                args = self.valid_args()
+                index = args.index(option)
+                del args[index:index + 2]
+
+                result = self.run_cleaner(args)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode(
+                    "utf-8", errors="replace"
+                )
+                self.assertIn(option, stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assert_no_side_effects()
+
+    def test_unsupported_rule_is_rejected(self):
+        # "unknown-rule" is simply not a rule; "Trim" differs from the
+        # supported "trim" only by letter case, and rule names are
+        # case-sensitive. Both must exit 2 with an empty stdout -- with
+        # and without --include-changes, so neither the summary nor a
+        # changes array is printed -- and a stderr reason naming the
+        # unsupported rule and echoing the passed value.
+        for rule in ("unknown-rule", "Trim"):
+            for include_changes in (False, True):
+                with self.subTest(
+                    rule=rule, include_changes=include_changes
+                ):
+                    args = self.valid_args()
+                    args[args.index("--rule") + 1] = rule
+                    if include_changes:
+                        args.append("--include-changes")
+
+                    result = self.run_cleaner(args)
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b"")
+                    stderr_text = result.stderr.decode(
+                        "utf-8", errors="replace"
+                    )
+                    self.assertIn("unsupported rule", stderr_text)
+                    self.assertIn(rule, stderr_text)
+                    self.assertNotIn("Traceback", stderr_text)
+                    self.assert_no_side_effects()
+
+    def test_valid_trim_call_with_changes_is_the_success_control(self):
+        # The same input with every argument valid proves the failures
+        # above are caused by the argument errors, not by the sample:
+        # exit 0, empty stderr, and the summary with the changes detail
+        # for the single trimmed cell at record 2 (header is record 1).
+        result = self.run_cleaner(self.valid_args() + ["--include-changes"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {
+                "rows": 1,
+                "changed_cells": 1,
+                "changes": [
+                    {
+                        "record": 2,
+                        "column": "name",
+                        "before": " Alice ",
+                        "after": "Alice",
+                    }
+                ],
+            },
+        )
+        output_bytes = self.output_path.read_bytes()
+        self.assertFalse(output_bytes.startswith(codecs.BOM_UTF8))
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface.
+        with open(
+            self.output_path, "r", encoding="utf-8", newline=""
+        ) as outfile:
+            self.assertEqual(
+                list(csv.reader(outfile)),
+                [HEADER, ["Alice", "x,y"]],
+            )
+        self.assertEqual(self.input_path.read_bytes(), self.INPUT_BYTES)
 
 
 if __name__ == "__main__":
