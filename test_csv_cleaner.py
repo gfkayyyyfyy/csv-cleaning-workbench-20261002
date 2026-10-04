@@ -128,6 +128,22 @@ The tests exercise only the documented public CLI:
   input with exit code 2, empty stdout, the --null-marker / non-empty
   reason on stderr, no Python traceback and no new files. The input
   bytes stay unchanged throughout.
+* command-line argument validation: from one legal invocation against a
+  UTF-8 name,note sample (one data record: name " Alice ", note "x,y"),
+  removing any single required option (--input, --output, --column or
+  --rule) exits 2 with byte-for-byte empty stdout and the missing option
+  named on stderr via argparse without a Python traceback, and an
+  unsupported --rule value ("unknown-rule" or capitalized "Trim"), both
+  with and without --include-changes, exits 2 with empty stdout and an
+  "unsupported rule" diagnostic naming the passed value, so neither a
+  summary nor a changes detail is printed. Every failure leaves the
+  input byte-for-byte unchanged, never creates the planned output file
+  (omitting --output produces no implicit result) and leaves no other
+  file in the temporary directory. A control run of the same sample
+  with every valid argument and --include-changes exits 0 with empty
+  stderr, rows and changed_cells both 1 and the single record-2 change
+  " Alice " -> "Alice", exporting a BOM-free UTF-8 CSV whose header and
+  parsed note value are unchanged while the input stays byte-identical.
 """
 
 import codecs
@@ -2675,6 +2691,208 @@ class DryRunNullMarkerTests(unittest.TestCase):
                 self.assertEqual(input_path.read_bytes(), original_bytes)
 
         self.assert_workspace_holds_only([input_path.name])
+
+
+class ArgumentValidationCliTests(unittest.TestCase):
+    """Regression coverage for command-line argument validation.
+
+    Every scenario derives from one legal invocation against the same
+    small UTF-8 sample (name,note header plus a single data record whose
+    parsed name is " Alice " and whose parsed note is "x,y"), so an
+    argument error cannot be masked by an input-side problem:
+
+    * omitting any one of the required options (--input, --output,
+      --column or --rule) is rejected by argparse with exit code 2,
+      stdout byte-for-byte empty and the missing option named on
+      stderr, without a Python traceback;
+    * an unsupported --rule value ("unknown-rule", or "Trim" which is
+      not the lowercase "trim" name) is rejected with exit code 2,
+      empty stdout and an "unsupported rule" explanation that quotes
+      the value as passed, both with and without --include-changes, so
+      a failure prints neither a summary nor a changes detail.
+
+    Each failure must leave the input bytes exactly as they were, never
+    create the planned output file (missing --output means no implicit
+    result anywhere) and leave no other file behind in the temporary
+    directory. A final control run with every valid argument plus
+    --include-changes proves the sample itself succeeds: exit 0, empty
+    stderr, rows / changed_cells both 1, the single record-2 change
+    " Alice " -> "Alice", a BOM-free UTF-8 export with the header and
+    parsed note unchanged, and byte-for-byte unchanged input. Only the
+    standard library is used, via the public CLI entry point.
+    """
+
+    # One legal command line, with each value keyed by its option so a
+    # scenario can drop exactly one option/value pair.
+    BASE_OPTIONS = [
+        ("--input", "input.csv"),
+        ("--output", "cleaned.csv"),
+        ("--column", "name"),
+        ("--rule", "trim"),
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+        # The shared valid sample: UTF-8 without BOM, name,note header,
+        # one data record. The name is quoted so its surrounding plain
+        # spaces survive as parsed content; the note is quoted because
+        # it contains a comma and must parse as the single value x,y.
+        self.input_path = self.tmpdir / "input.csv"
+        self.original_bytes = encode_csv(
+            [HEADER, [" Alice ", "x,y"]], bom=False
+        )
+        self.input_path.write_bytes(self.original_bytes)
+        self.output_path = self.tmpdir / "cleaned.csv"
+
+    def argv_from_options(self, included, *, include_changes=False):
+        """Build the CLI argv from the included (option, value) pairs."""
+        argv = [sys.executable, str(SCRIPT_PATH)]
+        for option, value in included:
+            argv.extend([option, value])
+        if include_changes:
+            argv.append("--include-changes")
+        return argv
+
+    def run_cleaner(self, included, **kwargs):
+        return subprocess.run(
+            self.argv_from_options(included, **kwargs),
+            cwd=str(self.tmpdir),
+            capture_output=True,
+        )
+
+    def assert_no_new_files(self):
+        # The workspace holds exactly the prepared input file: no
+        # planned output and no stray file from the failed run.
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()),
+            [self.input_path.name],
+        )
+
+    def assert_argument_failure(self, result, *, output_expected,
+                                fragments):
+        """Shared public-shape assertions for one rejected invocation."""
+        self.assertEqual(result.returncode, 2)
+        # stdout must be empty byte-for-byte: neither the success
+        # summary nor any changes detail may be printed on failure.
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
+        for fragment in fragments:
+            self.assertIn(fragment, stderr_text)
+        # The rejection must come through the documented error path
+        # rather than an uncaught exception.
+        self.assertNotIn("Traceback", stderr_text)
+        # The planned output file must never appear; when --output was
+        # omitted nothing may be implicitly generated under any name.
+        self.assertFalse(output_expected.exists())
+        # The input is opened read-only: its exact bytes remain.
+        self.assertEqual(self.input_path.read_bytes(), self.original_bytes)
+        # No other file may have been left behind.
+        self.assert_no_new_files()
+
+    def test_each_missing_required_option_is_rejected(self):
+        # Drop exactly one required option (and its value) from the
+        # legal command line; every other argument stays valid. argparse
+        # reports the omitted option by name.
+        for dropped in ("--input", "--output", "--column", "--rule"):
+            with self.subTest(dropped=dropped):
+                # Recreate the workspace state per subtest so a stray
+                # file from one case could not satisfy another.
+                self.assertFalse(self.output_path.exists())
+                included = [pair for pair in self.BASE_OPTIONS
+                            if pair[0] != dropped]
+
+                result = self.run_cleaner(included)
+
+                self.assert_argument_failure(
+                    result,
+                    output_expected=self.output_path,
+                    fragments=["the following arguments are required",
+                               dropped],
+                )
+
+    def test_unsupported_rule_is_rejected_with_and_without_changes(self):
+        # Unknown rules fail through the tool's own documented error
+        # path (not argparse): the explanation says the rule is not
+        # supported and quotes the value exactly as passed. Running the
+        # case both without and with --include-changes proves a failure
+        # prints neither a summary nor a changes detail.
+        for rule_value in ("unknown-rule", "Trim"):
+            for include_changes in (False, True):
+                with self.subTest(rule=rule_value,
+                                  include_changes=include_changes):
+                    tag = (
+                        rule_value.replace("-", "_")
+                        + ("_with" if include_changes else "_without")
+                    )
+                    output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                    included = [
+                        ("--input", str(self.input_path)),
+                        ("--output", str(output_path)),
+                        ("--column", "name"),
+                        ("--rule", rule_value),
+                    ]
+                    result = subprocess.run(
+                        self.argv_from_options(
+                            included,
+                            include_changes=include_changes,
+                        ),
+                        cwd=str(self.tmpdir),
+                        capture_output=True,
+                    )
+
+                    self.assert_argument_failure(
+                        result,
+                        output_expected=output_path,
+                        fragments=["unsupported rule", rule_value],
+                    )
+
+    def test_valid_invocation_exports_one_trimmed_record(self):
+        # Success control with the same input and every valid argument:
+        # exit 0, empty stderr, rows and changed_cells both 1, and the
+        # changes array containing only record 2's name going from
+        # " Alice " to "Alice". The export is BOM-free UTF-8; the
+        # header and the parsed note value "x,y" stay unchanged and the
+        # input remains byte-for-byte identical.
+        result = self.run_cleaner(
+            self.BASE_OPTIONS,
+            include_changes=True,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        # stdout is exactly one JSON object; key order is not fixed.
+        summary = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(summary["rows"], 1)
+        self.assertEqual(summary["changed_cells"], 1)
+        self.assertEqual(
+            summary["changes"],
+            [{"record": 2, "column": "name",
+              "before": " Alice ", "after": "Alice"}],
+        )
+
+        self.assertTrue(self.output_path.exists())
+        raw_output = self.output_path.read_bytes()
+        self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+        with open(self.output_path, "r", encoding="utf-8",
+                  newline="") as outfile:
+            output_rows = list(csv.reader(outfile))
+        self.assertEqual(
+            output_rows,
+            [HEADER, ["Alice", "x,y"]],
+        )
+        # Header unchanged explicitly, and the note column (record 2)
+        # still parses as the single value x,y with its comma inside.
+        self.assertEqual(output_rows[0], HEADER)
+        self.assertEqual(output_rows[1][1], "x,y")
+        # Only the input and the new export exist; the input bytes are
+        # untouched.
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()),
+            sorted([self.input_path.name, self.output_path.name]),
+        )
+        self.assertEqual(self.input_path.read_bytes(), self.original_bytes)
 
 
 if __name__ == "__main__":
