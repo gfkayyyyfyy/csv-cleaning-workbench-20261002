@@ -1,0 +1,141 @@
+日期预览与导出说明（csv_cleaner.py）
+=====================================
+
+本文说明 csv_cleaner.py 的 normalize-date 规则在 --dry-run 预览模式与真实
+导出模式下各自做什么、两者如何关联，以及为什么一次成功的预览并不保证目标
+位置可写。文中行号对应仓库根目录的 csv_cleaner.py。
+
+
+一、日期处理与写出开关在源码中的位置
+------------------------------------
+
+- 日期解析与校验全部在 normalize_date()（csv_cleaner.py:97-139）。它只接受
+  YYYY-MM-DD、YYYY/MM/DD 和年份在后的 NN/NN/YYYY 三种写法（正则见
+  csv_cleaner.py:55-59），并要求是真实历法日期；空单元格保持为空。
+- --date-order 只决定"年份在后的斜杠日期"如何读：dmy 读作 DD/MM/YYYY，
+  mdy 读作 MM/DD/YYYY，无猜测、无回退（csv_cleaner.py:126-132）。选项与
+  规则的绑定在 csv_cleaner.py:242-246。YYYY-MM-DD 与 YYYY/MM/DD 在两种
+  顺序下都按年-月-日解读。
+- 输出路径的两项检查——"输出路径必须与输入不同"（csv_cleaner.py:248-249）
+  和"输出文件不得已存在"（csv_cleaner.py:250-251）——发生在读取输入之前，
+  且不区分是否 --dry-run，因此预览同样拒绝这两类路径冲突。
+- 输入由 read_records() 一次性读入（csv_cleaner.py:193-212）。记录号从 1
+  开始、表头占第 1 号；字段内被引号包围的真实换行不会增加记录号，因为
+  计数基于 csv.reader 返回的逻辑记录而非物理行。
+- 逐记录清洗与变更收集在 csv_cleaner.py:271-291。遇到第一个无效日期立即
+  报错退出（csv_cleaner.py:276-280），不会继续检查后续记录。
+- 写出开关是 csv_cleaner.py:293 的 `if not args.dry_run:`：只有非预览模式
+  才会以 "x"（独占创建）方式打开输出文件并写入（csv_cleaner.py:294-304），
+  编码为 utf-8（不写 BOM）。预览模式完全跳过这个分支，因此不创建任何文件
+  或目录，也不会触碰输出路径的父目录。
+- 两种模式打印的是同一个摘要 JSON（csv_cleaner.py:306-309）；加
+  --include-changes 时其中多出 changes 数组，按记录顺序列出每个被改动的
+  单元格。
+
+
+二、可保存为 dates.csv 的样例
+-----------------------------
+
+把下面内容保存为 UTF-8 编码的 dates.csv（表头为 due_date,note，共四条
+数据；第一条备注在引号内包含一个真实换行）：
+
+    due_date,note
+    05/06/2024,"line one
+    line two"
+    2024/02/29,leap day
+    2024-01-01,new year
+    ,
+
+四条数据的日期依次为 05/06/2024、2024/02/29、2024-01-01 和空字符串。
+
+
+三、预览（--dry-run）
+---------------------
+
+约定当前目录下不存在 missing 目录。执行：
+
+    python csv_cleaner.py --input dates.csv --output missing/preview.csv \
+        --column due_date --rule normalize-date --date-order mdy \
+        --include-changes --dry-run
+
+结果：退出码 0，标准错误为空，标准输出只有一行 JSON 对象：
+
+    {"rows": 4, "changed_cells": 2, "changes": [{"record": 2, "column": "due_date", "before": "05/06/2024", "after": "2024-05-06"}, {"record": 3, "column": "due_date", "before": "2024/02/29", "after": "2024-02-29"}]}
+
+要点：
+
+- rows 为 4（四条数据记录），changed_cells 为 2。
+- changes 按记录顺序只列记录 2 和记录 3：before 保留原值 05/06/2024 与
+  2024/02/29，after 分别为规范化后的 2024-05-06 与 2024-02-29。记录 4
+  的 2024-01-01 已是规范形式、记录 5 的日期为空，均不算变更。
+- 记录 2 的备注虽含引号内换行，仍只占一个记录号，所以 2024/02/29 所在的
+  是记录 3 而不是记录 4。
+- 尽管 missing 目录不存在，预览仍然成功：dry-run 跳过了整个写文件分支
+  （csv_cleaner.py:293-304），从不尝试创建 missing/ 或 preview.csv。
+  预览结束后磁盘上不新增任何文件或目录，dates.csv 内容不变。
+
+
+四、导出（去掉 --dry-run）
+-------------------------
+
+    python csv_cleaner.py --input dates.csv --output exported.csv \
+        --column due_date --rule normalize-date --date-order mdy \
+        --include-changes
+
+结果：退出码 0，标准错误为空，标准输出是与预览完全相同的 JSON 摘要
+（rows 为 4，changed_cells 为 2，changes 同样只列记录 2、3）。同时当前
+目录新增 exported.csv：保留原表头、原记录顺序和全部备注（包括第一条里
+引号包围的换行），仅把两条变更的日期写为 2024-05-06 和 2024-02-29；文件
+以 UTF-8 写出、无 BOM。输入文件 dates.csv 不被改动。
+
+注意导出要求 exported.csv 事先不存在（独占创建），若已存在会失败。
+
+
+五、失败示例：无效日期
+----------------------
+
+把 dates.csv 第二条日期改为 13/02/2024、第三条改为 02/30/2024，再运行
+与第三节相同的 mdy 预览命令。结果：
+
+- 退出码 2，标准输出为空，不创建任何输出文件或目录。
+- 标准错误只有一行：
+
+      error: invalid date in column 'due_date' at record 3: '13/02/2024'
+
+  它指出了列名 due_date、记录号 3 和原值 13/02/2024（mdy 下 13 被读作
+  月份，不是合法日期）。
+- 程序在第一个无效日期处即停止（csv_cleaner.py:276-280），因此不会报告
+  后面 02/30/2024 的错误。
+- 记录 2 备注中的引号内换行不会把记录号推高，所以出错的仍是记录 3。
+
+
+六、预览也拒绝路径冲突
+----------------------
+
+以下两类冲突即使在 --dry-run 下也同样被拒绝（检查在 csv_cleaner.py:248-251，
+位于 dry-run 分支之前）：
+
+- 输出路径与输入路径相同：
+
+      error: output path must be different from the input path
+
+- 输出文件已经存在（例如上节导出的 exported.csv 仍在）：
+
+      error: output file already exists: 'exported.csv'
+
+两种情况均退出 2、标准输出为空、标准错误说明冲突原因，已存在的原文件
+（无论是输入还是已存在的输出）内容保持不变。
+
+反过来，输出路径的父目录不存在（如 missing/preview.csv）并不阻止一次
+有效的预览——预览根本不访问该路径。但同样的命令去掉 --dry-run 后会因为
+无法创建文件而失败（退出 2，标准错误说明无法写出）。
+
+
+七、结论：日期校验与文件写入是两回事
+------------------------------------
+
+--dry-run 做的是"完整读取输入 + 应用规则校验 + 打印摘要"，不做"写文件"。
+因此预览打印的摘要 JSON 只说明数据可以通过校验、以及将会发生哪些变更，
+并不代表任何文件已经生成，也不保证真实导出时目标位置可写（父目录可能
+缺失、位置可能不可写、目标文件可能被他人抢先创建）。要得到文件，必须
+去掉 --dry-run 重新运行，并以导出命令本身的退出码和输出文件为准。
