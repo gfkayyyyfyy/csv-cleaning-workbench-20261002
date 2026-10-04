@@ -202,6 +202,30 @@ The tests exercise only the documented public CLI:
   1) with name changing from " Alice " to "Alice", and a BOM-free
   UTF-8 export whose header and note value are preserved while the
   input stays byte-for-byte untouched.
+* empty physical lines and empty fields at the CSV record boundary: all
+  runs use trim on the name column with --include-changes. With the
+  name,note header, a record 2 whose name parses as " Alice " and whose
+  quoted note is two-line text with a real newline, a completely empty
+  physical line before the trailing Bob,z record parses as record 3
+  with zero fields, so both the export and the --dry-run preview fail
+  with exit code 2, empty stdout and the "record 3 ... 0 field(s) ...
+  expected 2" diagnostic, leaving no cleaned Alice, no output file and
+  no other new file behind. A file whose very first physical line is
+  empty fails both modes with exit code 2, empty stdout and the
+  "input is empty ... no header record" diagnostic even though a normal
+  header follows. The success control keeps the same header with three
+  records: a name " Alice " whose quoted note holds two consecutive
+  real newlines (the blank physical line belongs to the note), a bare
+  comma meaning two empty fields, and Bob,z -- none of them rejected
+  or skipped. Both modes exit 0 with empty stderr and rows 3 /
+  changed_cells 1, the changes array listing only record 2 with name
+  " Alice " -> "Alice"; the export preserves all three records and the
+  note's real newlines as BOM-free UTF-8, and the preview prints the
+  identical JSON content without creating the output file or its
+  missing parent directory. Every sample runs with LF and CRLF record
+  separators and with and without a UTF-8 BOM, comparing parsed fields
+  and JSON content rather than equivalent quoting styles or JSON key
+  order, and the input bytes stay byte-for-byte unchanged.
 """
 
 import codecs
@@ -407,6 +431,19 @@ def encode_csv(rows, *, bom):
     csv.writer(buffer).writerows(rows)
     encoding = "utf-8-sig" if bom else "utf-8"
     return buffer.getvalue().encode(encoding)
+
+
+def encode_lines(lines, *, newline, bom):
+    """Join physical lines with the given record separator, as bytes.
+
+    Unlike encode_csv this keeps exact control of the physical layout:
+    an element may be a completely empty line or hold quoted newlines,
+    which the empty-line boundary samples need.
+    """
+    data = (newline.join(lines) + newline).encode("utf-8")
+    if bom:
+        data = codecs.BOM_UTF8 + data
+    return data
 
 
 class CsvCleanerCliTests(unittest.TestCase):
@@ -3735,6 +3772,218 @@ class NormalizeWhitespaceCliTests(unittest.TestCase):
         self.assert_incompatible_options_rejected(
             [HEADER], tag="ws_bad_header"
         )
+
+
+class EmptyLineBoundaryTests(unittest.TestCase):
+    """Empty physical lines and empty fields at the CSV record boundary.
+
+    Every run goes through the public CLI with --rule trim on the name
+    column and --include-changes, in both export and --dry-run modes,
+    against raw-byte inputs covering LF and CRLF record separators with
+    and without a UTF-8 BOM.
+    """
+
+    # Failure sample: record 2's quoted note is two-line text with a real
+    # newline; the completely empty physical line after it parses as
+    # record 3 with zero fields (the quoted newline does not advance the
+    # record number).
+    MID_FILE_EMPTY_LINE = [
+        "name,note",
+        '" Alice ","two\nlines"',
+        "",
+        "Bob,z",
+    ]
+
+    # Failure sample: an empty physical line before anything else, so the
+    # first record has zero fields and there is no header record at all,
+    # even though a normal header follows.
+    LEADING_EMPTY_LINE = [
+        "",
+        "name,note",
+        "Bob,z",
+    ]
+
+    # Success control: the blank physical line sits inside record 2's
+    # quoted note (two consecutive real newlines), record 3 is a bare
+    # comma meaning two empty fields, and record 4 is ordinary. None of
+    # these may be rejected or skipped.
+    SUCCESS_LINES = [
+        "name,note",
+        '" Alice ","first\n\nsecond"',
+        ",",
+        "Bob,z",
+    ]
+    SUCCESS_RECORDS = [
+        HEADER,
+        ["Alice", "first\n\nsecond"],
+        ["", ""],
+        ["Bob", "z"],
+    ]
+    SUCCESS_SUMMARY = {
+        "rows": 3,
+        "changed_cells": 1,
+        "changes": [
+            {"record": 2, "column": "name",
+             "before": " Alice ", "after": "Alice"},
+        ],
+    }
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_raw_input(self, data, *, tag):
+        """Write arbitrary raw bytes as an input file and report its path."""
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, dry_run):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "trim",
+            "--include-changes",
+        ]
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv,
+            cwd=str(self.tmpdir),
+            capture_output=True,
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def existing_names(self):
+        return {p.name for p in self.tmpdir.iterdir()}
+
+    def assert_fails_in_both_modes(self, lines, *, fragments, tag_prefix):
+        for newline in ("\n", "\r\n"):
+            for bom in (False, True):
+                for dry_run in (False, True):
+                    tag = "%s_%s_%s_%s" % (
+                        tag_prefix,
+                        "crlf" if newline == "\r\n" else "lf",
+                        "bom" if bom else "nobom",
+                        "dry" if dry_run else "export",
+                    )
+                    with self.subTest(newline=repr(newline), bom=bom,
+                                      dry_run=dry_run):
+                        data = encode_lines(lines, newline=newline, bom=bom)
+                        input_path, original_bytes = self.write_raw_input(
+                            data, tag=tag
+                        )
+                        output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                        self.assertFalse(output_path.exists())
+                        before = self.existing_names()
+
+                        result = self.run_cleaner(
+                            input_path, output_path, dry_run=dry_run
+                        )
+
+                        self.assertEqual(result.returncode, 2)
+                        self.assertEqual(result.stdout, b"")
+                        stderr_text = result.stderr.decode("utf-8")
+                        for fragment in fragments:
+                            self.assertIn(fragment, stderr_text)
+                        self.assertNotIn("Traceback", stderr_text)
+                        # No output file and no other new file appears, so
+                        # no cleaned record can be left behind anywhere.
+                        self.assertFalse(output_path.exists())
+                        self.assertEqual(self.existing_names(), before)
+                        # The input file is opened read-only: bytes remain.
+                        self.assertEqual(
+                            input_path.read_bytes(), original_bytes
+                        )
+
+    def test_mid_file_empty_line_is_zero_field_record_3(self):
+        self.assert_fails_in_both_modes(
+            self.MID_FILE_EMPTY_LINE,
+            fragments=["record 3", "0 field(s)", "expected 2"],
+            tag_prefix="midempty",
+        )
+
+    def test_leading_empty_line_means_no_header_record(self):
+        self.assert_fails_in_both_modes(
+            self.LEADING_EMPTY_LINE,
+            fragments=["input is empty", "no header record"],
+            tag_prefix="leadempty",
+        )
+
+    def test_quoted_blank_line_and_empty_fields_are_kept(self):
+        for newline in ("\n", "\r\n"):
+            for bom in (False, True):
+                tag = "keep_%s_%s" % (
+                    "crlf" if newline == "\r\n" else "lf",
+                    "bom" if bom else "nobom",
+                )
+                with self.subTest(newline=repr(newline), bom=bom):
+                    data = encode_lines(
+                        self.SUCCESS_LINES, newline=newline, bom=bom
+                    )
+                    input_path, original_bytes = self.write_raw_input(
+                        data, tag=tag
+                    )
+                    output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                    self.assertFalse(output_path.exists())
+
+                    result = self.run_cleaner(
+                        input_path, output_path, dry_run=False
+                    )
+
+                    self.assertEqual(result.returncode, 0)
+                    self.assertEqual(result.stderr, b"")
+                    # The whole stdout parses as one JSON object, compared
+                    # by content rather than key order.
+                    summary = json.loads(result.stdout.decode("utf-8"))
+                    self.assertEqual(summary, self.SUCCESS_SUMMARY)
+
+                    self.assertTrue(output_path.exists())
+                    raw_output = output_path.read_bytes()
+                    self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                    # Parsed records match regardless of the equivalent
+                    # quoting style or record separator the writer picks;
+                    # the note's real newlines survive inside record 2.
+                    self.assertEqual(
+                        self.read_output_records(output_path),
+                        self.SUCCESS_RECORDS,
+                    )
+                    self.assertEqual(
+                        input_path.read_bytes(), original_bytes
+                    )
+
+                    # The --dry-run preview of the same input prints the
+                    # identical JSON content and creates nothing, even
+                    # with the output below a missing parent directory.
+                    preview_parent = self.tmpdir / f"missing_{tag}"
+                    preview_path = preview_parent / f"cleaned_{tag}.csv"
+                    self.assertFalse(preview_parent.exists())
+                    before = self.existing_names()
+
+                    preview = self.run_cleaner(
+                        input_path, preview_path, dry_run=True
+                    )
+
+                    self.assertEqual(preview.returncode, 0)
+                    self.assertEqual(preview.stderr, b"")
+                    self.assertEqual(
+                        json.loads(preview.stdout.decode("utf-8")),
+                        summary,
+                    )
+                    self.assertFalse(preview_path.exists())
+                    self.assertFalse(preview_parent.exists())
+                    self.assertEqual(self.existing_names(), before)
+                    self.assertEqual(
+                        input_path.read_bytes(), original_bytes
+                    )
 
 
 if __name__ == "__main__":
