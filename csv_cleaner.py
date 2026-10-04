@@ -44,6 +44,14 @@ of whitespace (judged by str.isspace) to one ASCII space:
     python csv_cleaner.py --input input.csv --output cleaned.csv \
         --column name --rule normalize-whitespace
 
+--delimiter selects the field separator by name: comma (the default
+when omitted), semicolon or tab (an actual tab character). The chosen
+delimiter is used both to read the input and to write the output; the
+format is never guessed:
+
+    python csv_cleaner.py --input input.csv --output cleaned.csv \
+        --column name --rule trim --delimiter semicolon
+
 On success prints a single JSON object to stdout, e.g.
     {"rows": 3, "changed_cells": 2}
 and exits 0. Any failure exits 2 with the reason on stderr and no output
@@ -82,6 +90,12 @@ DATE_YMD_SLASH_RE = re.compile(r"^([0-9]{4})/([0-9]{2})/([0-9]{2})$")
 # Accepted --date-order values: how to read a NN/NN/YYYY slash date.
 DATE_ORDERS = ("dmy", "mdy")
 DEFAULT_DATE_ORDER = "dmy"
+
+# Accepted --delimiter names mapped to the actual separator character.
+# The same delimiter is used for reading the input and writing the
+# output; the format is never guessed.
+DELIMITERS = {"comma": ",", "semicolon": ";", "tab": "\t"}
+DEFAULT_DELIMITER = "comma"
 
 
 class InvalidDateError(ValueError):
@@ -227,6 +241,14 @@ def parse_args(argv):
                              "default when omitted) or mdy (MM/DD/YYYY); "
                              "YYYY-MM-DD and YYYY/MM/DD stay year-month-day "
                              "under either order")
+    parser.add_argument("--delimiter", choices=sorted(DELIMITERS),
+                        default=DEFAULT_DELIMITER,
+                        metavar="NAME",
+                        help="field separator used for both reading the "
+                             "input and writing the output: comma (the "
+                             "default when omitted), semicolon or tab "
+                             "(an actual tab character); the format is "
+                             "never guessed")
     parser.add_argument("--include-changes", action="store_true",
                         help="add a changes array to the success summary "
                              "with one {record, column, before, after} "
@@ -238,16 +260,17 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def read_records(path):
+def read_records(path, delimiter):
     """Read all CSV records, returning a list of (record_number, fields).
 
     Record numbers start at 1 for the header; quoted newlines inside a
-    field do not advance the number.
+    field do not advance the number. The given delimiter character is
+    the only field separator.
     """
     records = []
     try:
         with open(path, "r", encoding="utf-8-sig", newline="") as infile:
-            reader = csv.reader(infile, strict=True)
+            reader = csv.reader(infile, delimiter=delimiter, strict=True)
             try:
                 for record_no, record in enumerate(reader, start=1):
                     records.append((record_no, record))
@@ -306,7 +329,7 @@ def main(argv=None):
     if os.path.exists(args.output):
         fail(f"output file already exists: {args.output!r}")
 
-    records = read_records(args.input)
+    records = read_records(args.input, DELIMITERS[args.delimiter])
 
     if not records or not records[0][1]:
         fail("input is empty: no header record")
@@ -349,7 +372,9 @@ def main(argv=None):
     if not args.dry_run:
         try:
             with open(args.output, "x", encoding="utf-8", newline="") as outfile:
-                csv.writer(outfile).writerows(out_rows)
+                csv.writer(outfile,
+                           delimiter=DELIMITERS[args.delimiter]).writerows(
+                               out_rows)
         except FileExistsError:
             fail(f"output file already exists: {args.output!r}")
         except OSError as exc:
