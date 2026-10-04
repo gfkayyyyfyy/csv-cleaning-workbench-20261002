@@ -271,6 +271,28 @@ The tests exercise only the documented public CLI:
   both on the two-record data file and on a header-only file.
   Omitting the option on a comma-separated file keeps the default
   comma entry point's original behavior.
+* --delimiter tab: the tab name maps to one real tab character used for
+  both reading and exporting. The name,note acceptance sample has four
+  records whose names parse as " Alice ", Bob, three ASCII spaces and an
+  already-empty string, while the first note itself embeds a real tab, a
+  double quote and a quoted real newline (its JSON string spelling is
+  "x\ty\"z\nnext") and the other notes are ok, z and end. A trim run
+  with --delimiter tab is exercised with and without a UTF-8 BOM: exit
+  0, empty stderr and a single JSON object reporting rows 4 /
+  changed_cells 2; with --include-changes only records 2 and 4 are
+  listed in order, each on column name, before keeping the original
+  whitespace and after being "Alice" and the empty string, and without
+  the switch there is no changes key. The export is BOM-free UTF-8
+  written with tab separators, so reading it back with the tab dialect
+  restores the header, record order and every note value unchanged, and
+  the input bytes stay untouched. A --dry-run of the same input prints
+  the identical JSON content and, with the output below a nonexistent
+  parent directory, creates neither the directory nor the file. Changing
+  the third data record to a one-field record (the first note's quoted
+  newline is retained) fails both the preview and the export with exit
+  code 2, empty stdout and the "record 4 ... 1 field(s) ... expected 2"
+  diagnostic without a Python traceback, leaving no output file and
+  byte-for-byte unchanged input.
 """
 
 import codecs
@@ -4610,6 +4632,241 @@ class SemicolonDelimiterCliTests(unittest.TestCase):
             expected_rows,
         )
         self.assertEqual(input_path.read_bytes(), original_bytes)
+
+
+class TabDelimiterCliTests(unittest.TestCase):
+    """Regression coverage for the explicit --delimiter tab switch.
+
+    Every test goes through the documented public CLI against small UTF-8
+    CSV files in a private temporary directory: no external files or
+    network. Results are judged on parsed CSV fields and the parsed JSON
+    object, so equivalent quoting styles, record separators and JSON key
+    order are irrelevant. The tab delimiter must be used both to read the
+    input and to write the export.
+    """
+
+    # Acceptance sample serialized with a real tab as the field
+    # separator. The first note itself embeds a real tab, a double quote
+    # and a quoted real newline (its JSON string spelling is
+    # "x\ty\"z\nnext"), so it can only round-trip when the same tab
+    # delimiter is used for reading and writing and the quote handling
+    # stays intact.
+    SAMPLE_ROWS = [
+        ["name", "note"],
+        [" Alice ", 'x\ty"z\nnext'],
+        ["Bob", "ok"],
+        ["   ", "z"],                # three ASCII spaces trim to empty
+        ["", "end"],                 # already empty: not a change
+    ]
+    EXPECTED_ROWS = [
+        ["name", "note"],
+        ["Alice", 'x\ty"z\nnext'],
+        ["Bob", "ok"],
+        ["", "z"],
+        ["", "end"],
+    ]
+    EXPECTED_SUMMARY = {
+        "rows": 4,
+        "changed_cells": 2,
+        "changes": [
+            {"record": 2, "column": "name",
+             "before": " Alice ", "after": "Alice"},
+            {"record": 4, "column": "name",
+             "before": "   ", "after": ""},
+        ],
+    }
+    # The malformed variant: the third data record holds only the name
+    # field, so it is one field short of the two-column header. The
+    # first note's quoted real newline is retained, proving the record
+    # number in the diagnostic ignores embedded newlines.
+    SHORT_RECORD_ROWS = [
+        ["name", "note"],
+        [" Alice ", 'x\ty"z\nnext'],
+        ["Bob", "ok"],
+        ["   "],
+        ["", "end"],
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag):
+        """Serialize rows with a real tab field delimiter, as UTF-8 bytes."""
+        buffer = io.StringIO()
+        csv.writer(buffer, delimiter="\t").writerows(rows)
+        encoding = "utf-8-sig" if bom else "utf-8"
+        data = buffer.getvalue().encode(encoding)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *,
+                    include_changes=False, dry_run=False):
+        argv = [
+            sys.executable, str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "trim",
+            "--delimiter", "tab",
+        ]
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as
+        # content; the tab dialect must restore the original fields.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile, delimiter="\t"))
+
+    def workspace_names(self):
+        return sorted(p.name for p in self.tmpdir.iterdir())
+
+    def test_tab_used_for_read_and_export_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "tab_bom" if bom else "tab_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.SAMPLE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path, include_changes=True
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # The whole stdout must parse as one JSON object and
+                # nothing else; json.loads rejects trailing junk.
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(summary, self.EXPECTED_SUMMARY)
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                # The export is BOM-free UTF-8 even when the input had
+                # a BOM.
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                # The header line really uses a real tab separator, not
+                # the comma default.
+                self.assertTrue(raw_output.startswith(b"name\tnote"))
+                # Read back with the tab dialect: the header, record
+                # order and every note value survive, including the
+                # embedded tab, double quote and real newline.
+                self.assertEqual(
+                    self.read_output_records(output_path),
+                    self.EXPECTED_ROWS,
+                )
+
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_tab_export_without_include_changes_has_no_changes_key(self):
+        input_path, original_bytes = self.write_input(
+            self.SAMPLE_ROWS, bom=False, tag="tab_plain"
+        )
+        output_path = self.tmpdir / "cleaned_tab_plain.csv"
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        # Exactly the two-key summary: no changes array without the
+        # --include-changes switch.
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 4, "changed_cells": 2},
+        )
+        self.assertEqual(
+            self.read_output_records(output_path), self.EXPECTED_ROWS
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_tab_dry_run_matches_export_and_creates_nothing(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "tab_dry_bom" if bom else "tab_dry_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.SAMPLE_ROWS, bom=bom, tag=tag
+                )
+                # Reference: a real export of the same input.
+                export_path = self.tmpdir / f"export_{tag}.csv"
+                export_result = self.run_cleaner(
+                    input_path, export_path, include_changes=True
+                )
+                self.assertEqual(export_result.returncode, 0)
+                reference_summary = json.loads(
+                    export_result.stdout.decode("utf-8")
+                )
+
+                # The preview output sits below a parent directory that
+                # does not exist.
+                missing_dir = self.tmpdir / f"nodir_{tag}"
+                preview_path = missing_dir / "cleaned.csv"
+                self.assertFalse(missing_dir.exists())
+                self.assertFalse(preview_path.exists())
+                # Snapshot after the reference export: the preview must
+                # not add even a directory or stray file on top of it.
+                before_names = self.workspace_names()
+
+                result = self.run_cleaner(
+                    input_path, preview_path,
+                    include_changes=True, dry_run=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # Same JSON content as the real export, compared by
+                # parsed content rather than key order or spacing.
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    reference_summary,
+                )
+                # Neither the file nor its missing parent is created,
+                # and nothing else appears in the workspace.
+                self.assertFalse(preview_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(self.workspace_names(), before_names)
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_short_record_fails_in_preview_and_export(self):
+        # The third data record has only the name field. Record 2's note
+        # contains a quoted real newline, so it spans two physical lines
+        # but counts as one CSV record: the short record is CSV record 4
+        # (the header counts as record 1). Both the export and the
+        # --dry-run preview must fail the same way.
+        input_path, original_bytes = self.write_input(
+            self.SHORT_RECORD_ROWS, bom=False, tag="tab_short"
+        )
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                tag = "tab_short_dry" if dry_run else "tab_short_export"
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+                before_names = self.workspace_names()
+
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=dry_run
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(
+                    result.stderr.decode("utf-8"),
+                    "error: record 4 has 1 field(s), expected 2\n",
+                )
+                self.assertFalse(output_path.exists())
+                # No output file or any other new file appears.
+                self.assertEqual(self.workspace_names(), before_names)
+                self.assertEqual(input_path.read_bytes(), original_bytes)
 
 
 if __name__ == "__main__":
