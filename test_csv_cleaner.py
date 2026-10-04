@@ -300,6 +300,32 @@ The tests exercise only the documented public CLI:
   preview with exit code 2, empty stdout and the "record 4 ... 1
   field(s) ... expected 2" diagnostic, no Python traceback, no
   output file and untouched input bytes.
+* --output-delimiter: the export delimiter is chosen independently of
+  the --delimiter used for reading. The name,note acceptance sample is
+  written with semicolons and has three records whose names parse as
+  " Alice ", Bob and three ASCII spaces, while the first note parses as
+  'x;y,z"q' plus a real newline and 'next' (a semicolon, a comma, a
+  double quote and a quoted real newline inside one field) and the
+  other notes are ok and end. A trim run with --delimiter semicolon and
+  --output-delimiter comma is exercised with and without a UTF-8 BOM:
+  exit 0, empty stderr, a BOM-free UTF-8 export that reads back under
+  the comma dialect with the header, record order and every note value
+  unchanged and the names Alice, Bob and the empty string, and a
+  summary of rows 3 / changed_cells 2 -- the delimiter conversion
+  itself never counts as a changed cell. With --include-changes only
+  records 2 and 4 are listed in order (the quoted newline does not
+  advance the record number), before keeping the original whitespace
+  and after being "Alice" and the empty string. --output-delimiter tab
+  exports the same content with real tabs, and omitting the option
+  keeps the input delimiter (semicolon) for the export. A --dry-run of
+  the same input prints the identical JSON content as the real export
+  and, with the output below a nonexistent parent directory, creates
+  neither the directory nor the file. --output-delimiter with no
+  following value, with an empty string or with the capitalized
+  "Comma" fails with exit code 2, empty stdout, a stderr reason naming
+  --output-delimiter and the missing or illegal value, no output file
+  and untouched input bytes, both on the data sample and on a
+  header-only input.
 """
 
 import codecs
@@ -5300,6 +5326,327 @@ class TabDelimiterCliTests(unittest.TestCase):
                 self.assertFalse(output_path.exists())
                 self.assertEqual(self.workspace_names(), before_names)
                 self.assertEqual(input_path.read_bytes(), original_bytes)
+
+
+class OutputDelimiterCliTests(unittest.TestCase):
+    """Regression coverage for the independent --output-delimiter switch.
+
+    Every test goes through the documented public CLI against small UTF-8
+    CSV files in a private temporary directory: no external files or
+    network. Results are judged on parsed CSV fields and the parsed JSON
+    object, so equivalent quoting styles, record separators and JSON key
+    order are irrelevant. The input is always read with --delimiter
+    semicolon; --output-delimiter overrides only the export format, and
+    omitting it keeps the input delimiter for writing. A delimiter change
+    is a pure format change and never counts as a changed cell.
+    """
+
+    # Acceptance sample serialized with semicolon field separators. The
+    # first note embeds a semicolon, a comma, a double quote and a quoted
+    # real newline, so it only round-trips when each side is parsed with
+    # its own delimiter and the quote handling stays intact.
+    SAMPLE_ROWS = [
+        ["name", "note"],
+        [" Alice ", 'x;y,z"q\nnext'],
+        ["Bob", "ok"],
+        ["   ", "end"],               # three ASCII spaces trim to empty
+    ]
+    EXPECTED_ROWS = [
+        ["name", "note"],
+        ["Alice", 'x;y,z"q\nnext'],
+        ["Bob", "ok"],
+        ["", "end"],
+    ]
+    # Every record is re-delimited on export, yet only the two trimmed
+    # names count: a delimiter conversion is never a changed cell.
+    EXPECTED_SUMMARY = {
+        "rows": 3,
+        "changed_cells": 2,
+        "changes": [
+            {"record": 2, "column": "name",
+             "before": " Alice ", "after": "Alice"},
+            {"record": 4, "column": "name",
+             "before": "   ", "after": ""},
+        ],
+    }
+    HEADER_ONLY_ROWS = [["name", "note"]]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag):
+        """Serialize rows with semicolon field separators, as UTF-8 bytes."""
+        buffer = io.StringIO()
+        csv.writer(buffer, delimiter=";").writerows(rows)
+        encoding = "utf-8-sig" if bom else "utf-8"
+        data = buffer.getvalue().encode(encoding)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *,
+                    output_delimiter="OMITTED",
+                    dry_run=False, include_changes=False):
+        # output_delimiter="OMITTED" means --output-delimiter is not
+        # passed at all (the export reuses the input delimiter); None
+        # means the bare flag with no following value.
+        argv = [
+            sys.executable, str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "trim",
+            "--delimiter", "semicolon",
+        ]
+        if output_delimiter != "OMITTED":
+            argv.append("--output-delimiter")
+            if output_delimiter is not None:
+                argv.append(output_delimiter)
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path, field_delimiter):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as
+        # content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile, delimiter=field_delimiter))
+
+    def workspace_names(self):
+        return sorted(p.name for p in self.tmpdir.iterdir())
+
+    def test_comma_export_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "outcomma_bom" if bom else "outcomma_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.SAMPLE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    output_delimiter="comma", include_changes=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # The whole stdout must parse as one JSON object and
+                # nothing else; json.loads rejects trailing junk. The
+                # delimiter conversion of every record is not a change:
+                # only the two trimmed names are counted and listed.
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(summary, self.EXPECTED_SUMMARY)
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                # The export is BOM-free UTF-8 even when the input had
+                # a BOM, and the header is really comma-separated.
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                self.assertTrue(raw_output.startswith(b"name,note"))
+                # Read back with the comma dialect: the header, record
+                # order and every note value survive, including the
+                # embedded semicolon, comma, double quote and real
+                # newline.
+                self.assertEqual(
+                    self.read_output_records(output_path, ","),
+                    self.EXPECTED_ROWS,
+                )
+
+                # Without --include-changes the summary keeps its
+                # two-key shape: no changes field at all.
+                plain_path = self.tmpdir / f"cleaned_plain_{tag}.csv"
+                plain = self.run_cleaner(
+                    input_path, plain_path, output_delimiter="comma"
+                )
+                self.assertEqual(plain.returncode, 0)
+                self.assertEqual(plain.stderr, b"")
+                self.assertEqual(
+                    json.loads(plain.stdout.decode("utf-8")),
+                    {"rows": 3, "changed_cells": 2},
+                )
+                self.assertEqual(
+                    self.read_output_records(plain_path, ","),
+                    self.EXPECTED_ROWS,
+                )
+
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_tab_export_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "outtab_bom" if bom else "outtab_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.SAMPLE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    output_delimiter="tab", include_changes=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    self.EXPECTED_SUMMARY,
+                )
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                # The header is really separated by one real tab.
+                self.assertTrue(raw_output.startswith(b"name\tnote"))
+                # Read back with the tab dialect: the same parsed content
+                # as the comma export, quoting style aside.
+                self.assertEqual(
+                    self.read_output_records(output_path, "\t"),
+                    self.EXPECTED_ROWS,
+                )
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_omitted_output_delimiter_reuses_input_delimiter(self):
+        # Without --output-delimiter the export keeps the --delimiter
+        # semicolon used for reading, exactly as before the option
+        # existed.
+        input_path, original_bytes = self.write_input(
+            self.SAMPLE_ROWS, bom=False, tag="outdelim_omitted"
+        )
+        output_path = self.tmpdir / "cleaned_outdelim_omitted.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path, include_changes=True
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            self.EXPECTED_SUMMARY,
+        )
+        self.assertTrue(output_path.exists())
+        raw_output = output_path.read_bytes()
+        self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+        # The header is still semicolon-separated, and the semicolon
+        # dialect restores every record unchanged.
+        self.assertTrue(raw_output.startswith(b"name;note"))
+        self.assertEqual(
+            self.read_output_records(output_path, ";"),
+            self.EXPECTED_ROWS,
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_dry_run_matches_export_and_creates_nothing(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "outcomma_dry_bom" if bom else "outcomma_dry_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.SAMPLE_ROWS, bom=bom, tag=tag
+                )
+                # Reference: a real export of the same input.
+                export_path = self.tmpdir / f"export_{tag}.csv"
+                export_result = self.run_cleaner(
+                    input_path, export_path,
+                    output_delimiter="comma", include_changes=True,
+                )
+                self.assertEqual(export_result.returncode, 0)
+                reference_summary = json.loads(
+                    export_result.stdout.decode("utf-8")
+                )
+
+                # The preview output sits below a parent directory that
+                # does not exist.
+                missing_dir = self.tmpdir / f"nodir_{tag}"
+                preview_path = missing_dir / "cleaned.csv"
+                self.assertFalse(missing_dir.exists())
+                self.assertFalse(preview_path.exists())
+                # Snapshot after the reference export: the preview must
+                # not add even a directory or stray file on top of it.
+                before_names = self.workspace_names()
+
+                result = self.run_cleaner(
+                    input_path, preview_path,
+                    output_delimiter="comma",
+                    dry_run=True, include_changes=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # Same JSON content as the real export, compared by
+                # parsed content rather than key order or spacing.
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    reference_summary,
+                )
+                # Neither the file nor its missing parent is created,
+                # and nothing else appears in the workspace.
+                self.assertFalse(preview_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(self.workspace_names(), before_names)
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_invalid_output_delimiter_values_rejected(self):
+        # None: the bare --output-delimiter flag with no following
+        # value; "": an explicit empty string; "Comma": the lowercase
+        # choice names are case-sensitive. argparse must reject each
+        # one (exit 2) before any file is touched, on both the data
+        # sample and a header-only file.
+        cases = [
+            (None, "expected one argument", None),
+            ("", "invalid choice", "''"),
+            ("Comma", "invalid choice", "Comma"),
+        ]
+        for sample_name, rows in (
+            ("data", self.SAMPLE_ROWS),
+            ("header_only", self.HEADER_ONLY_ROWS),
+        ):
+            for value, reason, echoed in cases:
+                with self.subTest(sample=sample_name, value=value):
+                    tag = "outdelim_%s_%s" % (
+                        sample_name,
+                        {None: "missing", "": "empty",
+                         "Comma": "capitalized"}[value],
+                    )
+                    input_path, original_bytes = self.write_input(
+                        rows, bom=False, tag=tag
+                    )
+                    output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                    self.assertFalse(output_path.exists())
+                    before_names = self.workspace_names()
+
+                    result = self.run_cleaner(
+                        input_path, output_path, output_delimiter=value
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b"")
+                    stderr_text = result.stderr.decode(
+                        "utf-8", errors="replace"
+                    )
+                    # The diagnostic names the option and whether the
+                    # value was missing or an illegal choice.
+                    self.assertIn("--output-delimiter", stderr_text)
+                    self.assertIn(reason, stderr_text)
+                    if echoed is not None:
+                        self.assertIn(echoed, stderr_text)
+                    self.assertNotIn("Traceback", stderr_text)
+                    self.assertFalse(output_path.exists())
+                    # No output file or any other new file appears.
+                    self.assertEqual(self.workspace_names(), before_names)
+                    self.assertEqual(
+                        input_path.read_bytes(), original_bytes
+                    )
 
 
 if __name__ == "__main__":
