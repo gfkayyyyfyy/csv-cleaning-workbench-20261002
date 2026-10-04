@@ -37,6 +37,21 @@ The field delimiter is chosen explicitly with --delimiter:
     delimiter is used both to read the input and to write the result,
     never guessed from the file contents.
 
+    The export delimiter can be chosen independently with
+    --output-delimiter:
+
+    python csv_cleaner.py --input sample.csv --output cleaned.csv \
+        --column name --rule trim --delimiter semicolon \
+        --output-delimiter comma
+
+    --output-delimiter accepts the same lowercase names comma,
+    semicolon and tab. When given it overrides only the output format:
+    the input is still read with --delimiter, and any of the three
+    combinations is allowed. Omitting it keeps one shared delimiter for
+    reading and writing (comma when --delimiter is also omitted). A
+    change of delimiter is only a format change and never counts as a
+    changed cell.
+
 normalize-date additionally accepts --date-order to choose how a slash
 date with the year last is read:
 
@@ -97,9 +112,10 @@ DATE_DOT_RE = re.compile(r"^([0-9]{4})\.([0-9]{2})\.([0-9]{2})$")
 DATE_ORDERS = ("dmy", "mdy")
 DEFAULT_DATE_ORDER = "dmy"
 
-# Accepted --delimiter names mapped to the actual one-character field
-# delimiters. The delimiter is always explicit (defaulting to comma) and
-# is used for both reading and writing; it is never sniffed.
+# Accepted --delimiter / --output-delimiter names mapped to the actual
+# one-character field delimiters. Each is always explicit: the input
+# delimiter defaults to comma, and the output delimiter defaults to the
+# input one; neither is ever sniffed.
 DELIMITERS = {"comma": ",", "semicolon": ";", "tab": "\t"}
 DEFAULT_DELIMITER_NAME = "comma"
 
@@ -257,10 +273,21 @@ def parse_args(argv):
     parser.add_argument("--delimiter", choices=sorted(DELIMITERS),
                         default=DEFAULT_DELIMITER_NAME,
                         metavar="NAME",
-                        help="field delimiter for both input and output: "
-                             "comma (the default when omitted), semicolon "
-                             "or tab (one real tab character); the "
-                             "delimiter is never guessed from the file")
+                        help="field delimiter for reading the input "
+                             "(and for writing unless --output-delimiter "
+                             "is given): comma (the default when "
+                             "omitted), semicolon or tab (one real tab "
+                             "character); the delimiter is never guessed "
+                             "from the file")
+    parser.add_argument("--output-delimiter", choices=sorted(DELIMITERS),
+                        default=None,
+                        metavar="NAME",
+                        help="field delimiter for the exported file "
+                             "only: comma, semicolon or tab (one real "
+                             "tab character); the input is still read "
+                             "with --delimiter, so any combination is "
+                             "allowed; omitting it writes with the same "
+                             "delimiter the input was read with")
     parser.add_argument("--include-changes", action="store_true",
                         help="add a changes array to the success summary "
                              "with one {record, column, before, after} "
@@ -300,9 +327,19 @@ def main(argv=None):
 
     # argparse --delimiter choices already reject a missing value or
     # anything other than the lowercase names comma / semicolon / tab
-    # (exit 2); the mapping gives the actual one-character delimiter used
-    # for both reading and writing, with comma as the default.
+    # (exit 2); the mapping gives the actual one-character delimiter
+    # used for reading, with comma as the default.
     delimiter = DELIMITERS[args.delimiter]
+
+    # --output-delimiter is validated by argparse the same way. When
+    # given it overrides only the export format; when omitted the output
+    # reuses the input delimiter (comma by default). A format change by
+    # itself never counts as a changed cell.
+    output_delimiter = (
+        DELIMITERS[args.output_delimiter]
+        if args.output_delimiter is not None
+        else delimiter
+    )
 
     rule = RULES.get(args.rule)
     if rule is None:
@@ -390,7 +427,8 @@ def main(argv=None):
     if not args.dry_run:
         try:
             with open(args.output, "x", encoding="utf-8", newline="") as outfile:
-                csv.writer(outfile, delimiter=delimiter).writerows(out_rows)
+                csv.writer(outfile,
+                           delimiter=output_delimiter).writerows(out_rows)
         except FileExistsError:
             fail(f"output file already exists: {args.output!r}")
         except OSError as exc:
