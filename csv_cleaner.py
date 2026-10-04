@@ -23,6 +23,21 @@ date with the year last is read:
     no guessing or fallback. YYYY-MM-DD and YYYY/MM/DD stay
     year-month-day under either order.
 
+normalize-whitespace flattens a cell to one line with single ASCII
+spaces between words:
+
+    python csv_cleaner.py --input input.csv --output cleaned.csv \
+        --column name --rule normalize-whitespace
+
+    Leading/trailing whitespace is removed and every internal run of
+    whitespace becomes one " ". Whitespace is whatever str.isspace()
+    recognizes, including tabs, carriage returns, newlines and the
+    ideographic space (U+3000). An empty string stays empty and a
+    whitespace-only string becomes empty; every other character keeps
+    its position, including U+200B. NULL, N/A and date text only have
+    their whitespace rearranged, never converted. --null-marker and
+    --date-order are not accepted with this rule.
+
 On success prints a single JSON object to stdout, e.g.
     {"rows": 3, "changed_cells": 2}
 and exits 0. Any failure exits 2 with the reason on stderr and no output
@@ -139,10 +154,25 @@ def normalize_date(value, date_order=DEFAULT_DATE_ORDER):
     return normalized.isoformat()
 
 
+def normalize_whitespace(value):
+    """Collapse the cell to one line with single ASCII spaces.
+
+    Leading and trailing whitespace is removed and every internal run of
+    whitespace is replaced by one ASCII space. Whitespace follows
+    str.isspace(), so tabs, carriage returns, newlines and the ideographic
+    space U+3000 all count, but U+200B zero-width space does not. An empty
+    string is returned unchanged and a whitespace-only string becomes
+    empty. Every other character keeps its place and order; in particular
+    NULL/N/A text and date-looking text only get whitespace rearranged.
+    """
+    return " ".join(value.split())
+
+
 RULES = {
     "trim": str.strip,
     "normalize-null": normalize_null,
     "normalize-date": normalize_date,
+    "normalize-whitespace": normalize_whitespace,
 }
 
 
