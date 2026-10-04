@@ -17,14 +17,17 @@ The tests exercise only the documented public CLI:
   is preserved verbatim including surrounding and internal whitespace.
   Also covers the header-only summary and case-sensitive column lookup.
 * normalize-date: blank cells become empty, real Gregorian dates spelled
-  YYYY-MM-DD or DD/MM/YYYY (ASCII digits, zero-padded) normalize to
-  YYYY-MM-DD, and the first invalid date (internal whitespace, unpadded
-  numbers, time suffixes, NULL/N/A text, nonexistent calendar dates)
-  fails by CSV record number without exporting anything. A year-boundary
-  regression pins the documented 0001-9999 range: both endpoints convert
-  (the low year keeps four digits), 2000-02-29 is a century leap day in
-  either spelling, and 1900-02-29, 29/02/2100, 0000-01-01 and
-  01/01/10000 are each rejected at record 3 without partial output.
+  YYYY-MM-DD, YYYY/MM/DD or DD/MM/YYYY (ASCII digits, zero-padded)
+  normalize to YYYY-MM-DD, and the first invalid date (internal
+  whitespace, unpadded numbers, time suffixes, NULL/N/A text,
+  nonexistent calendar dates) fails by CSV record number without
+  exporting anything. A year-boundary regression pins the documented
+  0001-9999 range: both endpoints convert (the low year keeps four
+  digits), 2000-02-29 is a century leap day in either spelling, and
+  1900-02-29, 29/02/2100, 0000-01-01 and 01/01/10000 are each rejected
+  at record 3 without partial output. The three spellings may be mixed
+  in one target column, e.g. " 2024/02/29 ", 01/03/2024 and
+  2024-03-02 convert side by side.
 * --null-marker: repeatable custom whole-value markers for the
   normalize-null rule. They coexist with the default blank / NULL / N/A
   handling; duplicate markers and markers equivalent to a default one
@@ -193,7 +196,7 @@ NULL_EXPECTED_NAMES = [
 # Rows 2, 3, 4 and 10 actually change; row 1 was already empty.
 NULL_EXPECTED_CHANGED = 4
 
-# normalize-date sample: the due_date column exercises both accepted
+# normalize-date sample: the due_date column exercises the accepted
 # spellings plus blank cells; the note column carries the quoting hazards
 # (commas, double quotes, a real newline) and must round-trip untouched.
 DATE_HEADER = ["due_date", "note"]
@@ -219,8 +222,15 @@ INVALID_DATE_VALUES = [
     "NULL",              # null marker text is not a date
     "N/A",
     "２０２４-０３-０１",   # fullwidth digits are not ASCII digits
-    "2024/03/01",        # slashes only in DD/MM/YYYY order
     "01-03-2024",        # dashes only in YYYY-MM-DD order
+    # The YYYY/MM/DD spelling keeps every boundary of the other two:
+    "2024/2/29",            # unpadded month
+    "2024/02/30",           # February never has 30 days
+    "0000/01/01",           # year 0000 is outside 0001-9999
+    "２０２４/０３/０１",      # fullwidth digits are not ASCII digits
+    "2024 /02/29",          # internal whitespace
+    "2024/03/01 10:30",     # time suffix
+    "10000/01/01",          # five-digit year
 ]
 
 # Year-boundary and century-leap regression for the documented 0001-9999
@@ -319,16 +329,19 @@ class CsvCleanerCliTests(unittest.TestCase):
         return path, data
 
     def run_cleaner(self, input_path, output_path, *, rule="trim",
-                    column="name"):
+                    column="name", include_changes=False):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", column,
+            "--rule", rule,
+        ]
+        if include_changes:
+            argv.append("--include-changes")
         return subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "--input", str(input_path),
-                "--output", str(output_path),
-                "--column", column,
-                "--rule", rule,
-            ],
+            argv,
             cwd=str(self.tmpdir),
             capture_output=True,
         )
@@ -733,6 +746,128 @@ class CsvCleanerCliTests(unittest.TestCase):
                 self.assertEqual(
                     input_path.read_bytes(), original_bytes
                 )
+
+    def test_normalize_date_mixes_all_three_spellings_with_changes(self):
+        # The documented dates.csv acceptance sample: the YYYY/MM/DD
+        # spelling with surrounding whitespace, DD/MM/YYYY and
+        # YYYY-MM-DD share the target column, followed by a
+        # whitespace-only cell. The notes carry a comma and plain text
+        # and must round-trip untouched. Records 2, 3 and 5 change
+        # (the ISO value at record 4 is already normalized); the blank
+        # stays blank and is not a change.
+        rows = [
+            DATE_HEADER,
+            [" 2024/02/29 ", "x,y"],
+            ["01/03/2024", "ok"],
+            ["2024-03-02", "z"],
+            ["   ", "blank"],
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag="date_mixed"
+        )
+        output_path = self.tmpdir / "cleaned_date_mixed.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+            include_changes=True,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        summary = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(summary["rows"], 4)
+        self.assertEqual(summary["changed_cells"], 3)
+        self.assertEqual(
+            summary["changes"],
+            [
+                {"record": 2, "column": "due_date",
+                 "before": " 2024/02/29 ", "after": "2024-02-29"},
+                {"record": 3, "column": "due_date",
+                 "before": "01/03/2024", "after": "2024-03-01"},
+                {"record": 5, "column": "due_date",
+                 "before": "   ", "after": ""},
+            ],
+        )
+
+        self.assertTrue(output_path.exists())
+        output_rows = self.read_output_records(output_path)
+        self.assertEqual(output_rows[0], DATE_HEADER)
+        self.assertEqual(len(output_rows), 5)
+        self.assertEqual(
+            [row[0] for row in output_rows[1:]],
+            ["2024-02-29", "2024-03-01", "2024-03-02", ""],
+        )
+        self.assertEqual(
+            [row[1] for row in output_rows],
+            [row[1] for row in rows],
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_year_slash_spelling_endpoints(self):
+        # The YYYY/MM/DD spelling honors the same 0001-9999 window and
+        # real-calendar checks as the other two: the low endpoint keeps
+        # four digits, the leap day converts, and a matching ISO value
+        # counts as unchanged.
+        rows = [
+            DATE_HEADER,
+            ["0001/01/01", "low endpoint"],
+            [" 2024/02/29 ", "leap day, padded ends"],
+            ["9999/12/31", "high endpoint"],
+            ["2024-02-29", "already ISO: not a change"],
+        ]
+        input_path, _ = self.write_input(
+            rows, bom=False, tag="date_slash_ymd"
+        )
+        output_path = self.tmpdir / "cleaned_date_slash_ymd.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 4, "changed_cells": 3},
+        )
+        self.assertEqual(
+            [row[0] for row in self.read_output_records(output_path)[1:]],
+            ["0001-01-01", "2024-02-29", "9999-12-31", "2024-02-29"],
+        )
+
+    def test_normalize_date_slash_spelling_first_error_exports_nothing(self):
+        # A cleanable YYYY/MM/DD record precedes an impossible date in
+        # the same spelling; the run must abort at record 3 with no
+        # partial output and the original value quoted on stderr.
+        rows = [
+            DATE_HEADER,
+            [" 2024/02/29 ", MULTILINE_NOTE],
+            ["2024/02/30", "bad date"],
+            ["2024-03-01", "never exported"],
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag="date_slash_invalid"
+        )
+        output_path = self.tmpdir / "cleaned_date_slash_invalid.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        for fragment in ("invalid date", "due_date", "record 3",
+                         "2024/02/30"):
+            self.assertIn(fragment, stderr_text)
+        self.assertNotIn("record 4", stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
 
     def assert_invalid_input_fails(self, input_path, output_path,
                                    original_bytes, fragments):
@@ -2205,6 +2340,92 @@ class DryRunNormalizeDateTests(unittest.TestCase):
                 self.assertFalse(output_path.exists())
                 self.assertEqual(input_path.read_bytes(), original_bytes)
                 self.assert_workspace_holds_only([input_path.name])
+
+    def test_date_preview_accepts_the_slash_year_spelling(self):
+        # The YYYY/MM/DD spelling takes the same --dry-run path as the
+        # other two: the mixed-spelling sample (padded " 2024/02/29 ",
+        # 01/03/2024, already-ISO 2024-03-02 and three spaces) previews
+        # rows 4 / changed_cells 3 with details on records 2, 3 and 5,
+        # and creates nothing; a real export writes the identical
+        # summary.
+        rows = [
+            DATE_HEADER,
+            [" 2024/02/29 ", "x,y"],
+            ["01/03/2024", "ok"],
+            ["2024-03-02", "z"],
+            ["   ", "blank"],
+        ]
+        expected_changes = [
+            {"record": 2, "column": "due_date",
+             "before": " 2024/02/29 ", "after": "2024-02-29"},
+            {"record": 3, "column": "due_date",
+             "before": "01/03/2024", "after": "2024-03-01"},
+            {"record": 5, "column": "due_date",
+             "before": "   ", "after": ""},
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, tag="date_preview_slash"
+        )
+        created = [input_path.name]
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                tag = "with" if include_changes else "without"
+                preview_path = self.tmpdir / f"preview_slash_{tag}.csv"
+                export_path = self.tmpdir / f"export_slash_{tag}.csv"
+                created += [f"export_slash_{tag}.csv"]
+
+                preview = self.run_cleaner(
+                    input_path, preview_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+                export = self.run_cleaner(
+                    input_path, export_path, dry_run=False,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(preview.returncode, 0)
+                self.assertEqual(preview.stderr, b"")
+                self.assertEqual(export.returncode, 0)
+                self.assertEqual(export.stderr, b"")
+                self.assertEqual(preview.stdout, export.stdout)
+                summary = json.loads(preview.stdout.decode("utf-8"))
+                expected = {"rows": 4, "changed_cells": 3}
+                if include_changes:
+                    expected["changes"] = expected_changes
+                self.assertEqual(summary, expected)
+                self.assertFalse(preview_path.exists())
+                self.assertTrue(export_path.exists())
+                self.assertEqual(
+                    [row[0]
+                     for row in self.read_output_records(export_path)[1:]],
+                    ["2024-02-29", "2024-03-01", "2024-03-02", ""],
+                )
+
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+        self.assert_workspace_holds_only(created)
+
+        # A preview of an invalid YYYY/MM/DD value fails the same way.
+        bad_rows = [
+            DATE_HEADER,
+            [" 2024/02/29 ", "fine"],
+            ["2024/02/30", "bad"],
+        ]
+        bad_input, bad_bytes = self.write_input(
+            bad_rows, tag="date_preview_slash_bad"
+        )
+        bad_output = self.tmpdir / "cleaned_date_preview_slash_bad.csv"
+        result = self.run_cleaner(
+            bad_input, bad_output, dry_run=True, include_changes=True
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        for fragment in ("invalid date", "due_date", "record 3",
+                         "2024/02/30"):
+            self.assertIn(fragment, stderr_text)
+        self.assertFalse(bad_output.exists())
+        self.assertEqual(bad_input.read_bytes(), bad_bytes)
 
 
 class DryRunNullMarkerTests(unittest.TestCase):

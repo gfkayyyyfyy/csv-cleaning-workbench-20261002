@@ -34,10 +34,11 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 与 `trim`、`normalize-date` 配合使用时，按参数错误处理（退出码 2）。
 
 `normalize-date`：先按 `str.strip` 去掉两端空白，空字符串或纯空白输出为空；其余
-只接受 `YYYY-MM-DD` 与 `DD/MM/YYYY` 两种写法，要求 ASCII 数字、四位年份、两位月日，
-且为公历 0001 至 9999 年内的真实日期，结果统一输出为 `YYYY-MM-DD`。内部空白、
-未补零的月日、时间后缀以及 `NULL`、`N/A` 等文本均为非法日期：目标列出现非法日期时
-按记录顺序报告首个错误（含列名与记录序号），退出码为 2，不创建输出文件。
+只接受 `YYYY-MM-DD`、`YYYY/MM/DD` 与 `DD/MM/YYYY` 三种写法，要求 ASCII 数字、
+四位年份、两位月日，且为公历 0001 至 9999 年内的真实日期，结果统一输出为
+`YYYY-MM-DD`；同一目标列可混用三种写法。内部空白、未补零的月日、时间后缀以及
+`NULL`、`N/A` 等文本均为非法日期：目标列出现非法日期时按记录顺序报告首个错误
+（含列名与记录序号），退出码为 2，不创建输出文件。
 
 成功时退出码为 0，标准输出只有一个 JSON 对象，例如 `{"rows": 3, "changed_cells": 2}`：
 `rows` 为数据记录数（不含表头），`changed_cells` 为清理前后字符串发生变化的单元格数。
