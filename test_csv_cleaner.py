@@ -244,6 +244,33 @@ The tests exercise only the documented public CLI:
   separators and with and without a UTF-8 BOM, comparing parsed fields
   and JSON content rather than equivalent quoting styles or JSON key
   order, and the input bytes stay byte-for-byte unchanged.
+* --delimiter semicolon: the explicit field delimiter is used for both
+  reading and exporting and is never guessed from the file. The
+  name,note acceptance sample has three records whose names parse as
+  " Alice ", three ASCII spaces and Bob, while the notes parse as
+  'x;y"z' plus a real newline and 'next', ok and z; the first note
+  embeds a semicolon, a double quote and a quoted real newline. A trim
+  run with --delimiter semicolon and --include-changes is exercised
+  with and without a UTF-8 BOM: exit 0, empty stderr and a single JSON
+  object reporting rows 3 / changed_cells 2, with changes listing only
+  records 2 and 3 in order, each on column name, before keeping the
+  original whitespace and after being "Alice" and the empty string.
+  The export is BOM-free UTF-8 written with semicolons, so reading it
+  back with the semicolon dialect restores the header, record order
+  and every note value unchanged, and the input bytes stay untouched.
+  A --dry-run of the same input prints the identical JSON content and,
+  with the output below a nonexistent parent directory, creates
+  neither the directory nor the file. The delimiter is never sniffed:
+  on a file holding just name;note and Bob;z, omitting --delimiter
+  (the documented comma default) fails with exit code 2, empty stdout,
+  a "column not found" reason naming name, no output file and
+  untouched input bytes. --delimiter with no following value, with an
+  empty string or with the capitalized "Semicolon" fails with exit
+  code 2, empty stdout, a stderr reason naming --delimiter and the
+  missing or illegal value, no output file and untouched input bytes,
+  both on the two-record data file and on a header-only file.
+  Omitting the option on a comma-separated file keeps the default
+  comma entry point's original behavior.
 """
 
 import codecs
@@ -4266,6 +4293,323 @@ class EmptyLineBoundaryTests(unittest.TestCase):
                     self.assertEqual(
                         input_path.read_bytes(), original_bytes
                     )
+
+
+class SemicolonDelimiterCliTests(unittest.TestCase):
+    """Regression coverage for the explicit --delimiter semicolon switch.
+
+    Every test goes through the documented public CLI against small UTF-8
+    CSV files in a private temporary directory: no external files or
+    network. Results are judged on parsed CSV fields and the parsed JSON
+    object, so equivalent quoting styles, record separators and JSON key
+    order are irrelevant. The chosen delimiter must be used both to read
+    the input and to write the export and must never be guessed from the
+    file contents; omitting the option keeps the default comma behavior.
+    """
+
+    # Acceptance sample serialized with semicolon field separators. The
+    # first note embeds a literal semicolon, a double quote and a quoted
+    # real newline, so it can only round-trip when the same delimiter is
+    # used for reading and writing and the quote handling stays intact.
+    SAMPLE_ROWS = [
+        ["name", "note"],
+        [" Alice ", 'x;y"z\nnext'],
+        ["   ", "ok"],                 # three ASCII spaces trim to empty
+        ["Bob", "z"],
+    ]
+    EXPECTED_ROWS = [
+        ["name", "note"],
+        ["Alice", 'x;y"z\nnext'],
+        ["", "ok"],
+        ["Bob", "z"],
+    ]
+    EXPECTED_SUMMARY = {
+        "rows": 3,
+        "changed_cells": 2,
+        "changes": [
+            {"record": 2, "column": "name",
+             "before": " Alice ", "after": "Alice"},
+            {"record": 3, "column": "name",
+             "before": "   ", "after": ""},
+        ],
+    }
+    # Smallest possible semicolon file for the no-guessing check: the
+    # header plus one data record.
+    TWO_ROWS = [
+        ["name", "note"],
+        ["Bob", "z"],
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag, field_delimiter=";"):
+        """Serialize rows with the given field delimiter, as UTF-8 bytes."""
+        buffer = io.StringIO()
+        csv.writer(buffer, delimiter=field_delimiter).writerows(rows)
+        encoding = "utf-8-sig" if bom else "utf-8"
+        data = buffer.getvalue().encode(encoding)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, delimiter="OMITTED",
+                    dry_run=False, include_changes=False):
+        # delimiter="OMITTED" means --delimiter is not passed at all
+        # (the documented comma default); None means the bare flag with
+        # no following value.
+        argv = [
+            sys.executable, str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "trim",
+        ]
+        if delimiter != "OMITTED":
+            argv.append("--delimiter")
+            if delimiter is not None:
+                argv.append(delimiter)
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path, field_delimiter=";"):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as
+        # content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile, delimiter=field_delimiter))
+
+    def workspace_names(self):
+        return sorted(p.name for p in self.tmpdir.iterdir())
+
+    def test_semicolon_used_for_read_and_export_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "semi_bom" if bom else "semi_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.SAMPLE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    delimiter="semicolon", include_changes=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # The whole stdout must parse as one JSON object and
+                # nothing else; json.loads rejects trailing junk.
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(summary, self.EXPECTED_SUMMARY)
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                # The export is BOM-free UTF-8 even when the input had
+                # a BOM.
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                # Read back with the semicolon dialect: the header,
+                # record order and every note value survive, including
+                # the embedded semicolon, double quote and real newline.
+                self.assertEqual(
+                    self.read_output_records(output_path),
+                    self.EXPECTED_ROWS,
+                )
+                # The same bytes parsed as a comma CSV collapse to one
+                # field per record, proving the export really uses
+                # semicolons rather than the comma default.
+                with open(
+                    output_path, "r", encoding="utf-8", newline=""
+                ) as outfile:
+                    comma_rows = list(csv.reader(outfile))
+                self.assertTrue(
+                    all(len(row) == 1 for row in comma_rows), comma_rows
+                )
+
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_semicolon_dry_run_matches_export_and_creates_nothing(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "semi_dry_bom" if bom else "semi_dry_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.SAMPLE_ROWS, bom=bom, tag=tag
+                )
+                # Reference: a real export of the same input.
+                export_path = self.tmpdir / f"export_{tag}.csv"
+                export_result = self.run_cleaner(
+                    input_path, export_path,
+                    delimiter="semicolon", include_changes=True,
+                )
+                self.assertEqual(export_result.returncode, 0)
+                reference_summary = json.loads(
+                    export_result.stdout.decode("utf-8")
+                )
+
+                # The preview output sits below a parent directory that
+                # does not exist.
+                missing_dir = self.tmpdir / f"nodir_{tag}"
+                preview_path = missing_dir / "cleaned.csv"
+                self.assertFalse(missing_dir.exists())
+                self.assertFalse(preview_path.exists())
+                # Snapshot after the reference export: the preview must
+                # not add even a directory or stray file on top of it.
+                before_names = self.workspace_names()
+
+                result = self.run_cleaner(
+                    input_path, preview_path,
+                    delimiter="semicolon", dry_run=True,
+                    include_changes=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # Same JSON content as the real export, compared by
+                # parsed content rather than key order or spacing.
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    reference_summary,
+                )
+                # Neither the file nor its missing parent is created,
+                # and nothing else appears in the workspace.
+                self.assertFalse(preview_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(self.workspace_names(), before_names)
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_delimiter_is_never_guessed_from_file_contents(self):
+        # A semicolon-separated file with the option omitted must be
+        # read with the comma default, so the header is a single column
+        # and "name" is not found -- nothing is sniffed from the data.
+        input_path, original_bytes = self.write_input(
+            self.TWO_ROWS, bom=False, tag="guess"
+        )
+        output_path = self.tmpdir / "cleaned_guess.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        self.assertIn("column not found", stderr_text)
+        self.assertIn("name", stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertFalse(output_path.exists())
+        self.assertEqual(self.workspace_names(), [input_path.name])
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_invalid_delimiter_values_rejected_on_data_and_header_only(self):
+        # None: the bare --delimiter flag with no following value;
+        # "": an explicit empty string; "Semicolon": the lowercase
+        # choice names are case-sensitive. argparse must reject each
+        # one (exit 2) before any file is touched, on both a data file
+        # and a header-only file.
+        cases = [
+            (None, "expected one argument", None),
+            ("", "invalid choice", "''"),
+            ("Semicolon", "invalid choice", "Semicolon"),
+        ]
+        for sample_name, rows in (
+            ("data", self.TWO_ROWS),
+            ("header_only", [["name", "note"]]),
+        ):
+            for value, reason, echoed in cases:
+                with self.subTest(sample=sample_name, value=value):
+                    tag = "delim_%s_%s" % (
+                        sample_name,
+                        {None: "missing", "": "empty",
+                         "Semicolon": "capitalized"}[value],
+                    )
+                    input_path, original_bytes = self.write_input(
+                        rows, bom=False, tag=tag
+                    )
+                    output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                    self.assertFalse(output_path.exists())
+                    before_names = self.workspace_names()
+
+                    result = self.run_cleaner(
+                        input_path, output_path, delimiter=value
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b"")
+                    stderr_text = result.stderr.decode(
+                        "utf-8", errors="replace"
+                    )
+                    # The diagnostic names the option and whether the
+                    # value was missing or an illegal choice.
+                    self.assertIn("--delimiter", stderr_text)
+                    self.assertIn(reason, stderr_text)
+                    if echoed is not None:
+                        self.assertIn(echoed, stderr_text)
+                    self.assertNotIn("Traceback", stderr_text)
+                    self.assertFalse(output_path.exists())
+                    # No output file or any other new file appears.
+                    self.assertEqual(self.workspace_names(), before_names)
+                    self.assertEqual(
+                        input_path.read_bytes(), original_bytes
+                    )
+
+    def test_omitted_delimiter_keeps_default_comma_entry_point(self):
+        # Control: without --delimiter a comma-separated file is read
+        # and exported exactly as before the semicolon feature existed.
+        comma_rows = [
+            ["name", "note"],
+            [" Alice ", "x,y"],
+            ["   ", "ok"],
+            ["Bob", "z"],
+        ]
+        expected_rows = [
+            ["name", "note"],
+            ["Alice", "x,y"],
+            ["", "ok"],
+            ["Bob", "z"],
+        ]
+        input_path, original_bytes = self.write_input(
+            comma_rows, bom=False, tag="comma_default",
+            field_delimiter=",",
+        )
+        output_path = self.tmpdir / "cleaned_comma_default.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path, include_changes=True
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {
+                "rows": 3,
+                "changed_cells": 2,
+                "changes": [
+                    {"record": 2, "column": "name",
+                     "before": " Alice ", "after": "Alice"},
+                    {"record": 3, "column": "name",
+                     "before": "   ", "after": ""},
+                ],
+            },
+        )
+        self.assertTrue(output_path.exists())
+        self.assertFalse(
+            output_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+        # The export parses under the comma dialect with the comma in
+        # the note preserved.
+        self.assertEqual(
+            self.read_output_records(output_path, field_delimiter=","),
+            expected_rows,
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
 
 
 if __name__ == "__main__":
