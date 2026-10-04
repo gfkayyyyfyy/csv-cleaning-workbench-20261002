@@ -27,6 +27,24 @@ The tests exercise only the documented public CLI:
   0001/01/01 slash spelling), 2000-02-29 is a century leap day in
   either spelling, and 1900-02-29, 29/02/2100, 0000-01-01 and
   01/01/10000 are each rejected at record 3 without partial output.
+* normalize-date --date-order: the optional --date-order takes only the
+  lowercase choices dmy and mdy and defaults to dmy when omitted, so the
+  existing DD/MM/YYYY reading is unchanged. Under mdy a slash date with
+  the four-digit year last is read as MM/DD/YYYY (05/06/2024 becomes
+  2024-05-06) with ambiguous fields settled by the chosen order and no
+  guessing or fallback: 13/02/2024 is month 13 and 02/30/2024 is
+  February 30, both rejected at the first offending record number (the
+  header is record 1, a quoted newline does not advance the number),
+  while the same 13/02/2024 is a clean 2024-02-13 under dmy.
+  YYYY-MM-DD and YYYY/MM/DD stay year-month-day under either order,
+  blank cells stay empty, the summary keeps its two-key shape and the
+  --include-changes entries list the raw before value and the order's
+  after value in record order. A missing or non-choice --date-order
+  value (DMY, ymd), or an explicit order paired with trim /
+  normalize-null, fails with exit code 2, empty stdout, the option and
+  reason on stderr, no Python traceback and no output file -- including
+  for a header-only input; a valid order on a header-only input exports
+  just the header with both counts at 0.
 * --null-marker: repeatable custom whole-value markers for the
   normalize-null rule. They coexist with the default blank / NULL / N/A
   handling; duplicate markers and markers equivalent to a default one
@@ -2832,6 +2850,266 @@ class ArgumentValidationTests(unittest.TestCase):
                 [HEADER, ["Alice", "x,y"]],
             )
         self.assertEqual(self.input_path.read_bytes(), self.INPUT_BYTES)
+
+
+class DateOrderCliTests(unittest.TestCase):
+    """Coverage for the optional normalize-date --date-order switch.
+
+    Every test goes through the documented public CLI against small CSV
+    files in a private temporary directory: no external files or network.
+    Results are judged on parsed CSV fields and the parsed JSON object,
+    so equivalent quoting styles and JSON key order are irrelevant.
+    """
+
+    # The acceptance sample: 05/06/2024 is ambiguous on purpose, the
+    # other rows pin that YYYY/MM/DD and YYYY-MM-DD stay year-month-day
+    # under either order and that an empty cell stays empty.
+    ORDER_ROWS = [
+        DATE_HEADER,
+        ["05/06/2024", "alpha"],       # 2024-05-06 (mdy) / 2024-06-05 (dmy)
+        ["2024/02/29", "beta"],        # YYYY/MM/DD -> 2024-02-29 either way
+        ["2024-01-01", "gamma"],       # already ISO: not a change
+        ["", "delta"],                 # already empty: not a change
+    ]
+    ORDER_EXPECTED_MDY = ["2024-05-06", "2024-02-29", "2024-01-01", ""]
+    ORDER_EXPECTED_DMY = ["2024-06-05", "2024-02-29", "2024-01-01", ""]
+    ORDER_EXPECTED_CHANGED = 2
+    ORDER_CHANGES_MDY = [
+        {"record": 2, "column": "due_date",
+         "before": "05/06/2024", "after": "2024-05-06"},
+        {"record": 3, "column": "due_date",
+         "before": "2024/02/29", "after": "2024-02-29"},
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, tag):
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(encode_csv(rows, bom=False))
+        return path
+
+    def run_cleaner(self, input_path, output_path, *, order="OMITTED",
+                    rule="normalize-date", column="due_date",
+                    include_changes=False):
+        # order="OMITTED" means the option is not passed at all; None
+        # means the bare flag with no following value.
+        argv = [
+            sys.executable, str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", column,
+            "--rule", rule,
+        ]
+        if order != "OMITTED":
+            argv.append("--date-order")
+            if order is not None:
+                argv.append(order)
+        if include_changes:
+            argv.append("--include-changes")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def test_mdy_reads_year_last_slash_dates_as_month_day(self):
+        input_path = self.write_input(self.ORDER_ROWS, tag="order_mdy")
+        output_path = self.tmpdir / "cleaned_order_mdy.csv"
+
+        result = self.run_cleaner(input_path, output_path, order="mdy")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 4, "changed_cells": self.ORDER_EXPECTED_CHANGED},
+        )
+        output_rows = self.read_output_records(output_path)
+        self.assertEqual(output_rows[0], DATE_HEADER)
+        self.assertEqual(
+            [row[0] for row in output_rows[1:]], self.ORDER_EXPECTED_MDY
+        )
+        # The note column, header and record order round-trip untouched.
+        self.assertEqual(
+            [row[1] for row in output_rows],
+            [row[1] for row in self.ORDER_ROWS],
+        )
+        self.assertFalse(
+            output_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+
+    def test_dmy_explicit_and_omitted_keep_day_month_reading(self):
+        # Omitting the option is exactly dmy: both runs export the same
+        # dates, starting with 2024-06-05 for the ambiguous value.
+        for tag, order in (("dmy_explicit", "dmy"), ("dmy_omitted", "OMITTED")):
+            with self.subTest(order=order):
+                input_path = self.write_input(self.ORDER_ROWS, tag=tag)
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+
+                result = self.run_cleaner(input_path, output_path, order=order)
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 4,
+                     "changed_cells": self.ORDER_EXPECTED_CHANGED},
+                )
+                self.assertEqual(
+                    [row[0] for row in self.read_output_records(output_path)[1:]],
+                    self.ORDER_EXPECTED_DMY,
+                )
+
+    def test_mdy_changes_detail_uses_ordered_after_value(self):
+        input_path = self.write_input(self.ORDER_ROWS, tag="order_changes")
+        output_path = self.tmpdir / "cleaned_order_changes.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path, order="mdy", include_changes=True
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        summary = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(summary["rows"], 4)
+        self.assertEqual(
+            summary["changed_cells"], self.ORDER_EXPECTED_CHANGED
+        )
+        self.assertEqual(summary["changes"], self.ORDER_CHANGES_MDY)
+        # No new summary fields beyond the documented three under the
+        # switch.
+        self.assertEqual(
+            sorted(summary), ["changed_cells", "changes", "rows"]
+        )
+
+    def test_mdy_rejects_impossible_dates_by_record_number(self):
+        # Record 2's note contains a quoted real newline, so it spans two
+        # physical lines but counts as one CSV record. Each impossible
+        # mdy date sits at record 3 and a second invalid date at record 4
+        # must never be reported: the first failure aborts the run.
+        for value in ("13/02/2024", "02/30/2024"):
+            with self.subTest(value=value):
+                rows = [
+                    DATE_HEADER,
+                    ["05/06/2024", MULTILINE_NOTE],
+                    [value, "candidate"],
+                    ["12/31/9999", "valid mdy, never reached"],
+                ]
+                input_path = self.write_input(rows, tag="order_bad")
+                output_path = self.tmpdir / "cleaned_order_bad.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path, order="mdy"
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 3", stderr_text)
+                self.assertIn(value, stderr_text)
+                self.assertNotIn("record 4", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+
+    def test_ambiguous_value_follows_chosen_order_without_fallback(self):
+        # 13/02/2024 is impossible as month 13 under mdy but a perfectly
+        # valid day-13 February date under dmy: the chosen order decides,
+        # there is no swapping or guessing when mdy parsing fails.
+        rows = [DATE_HEADER, ["13/02/2024", "ambiguous"]]
+        input_path = self.write_input(rows, tag="order_ambiguity")
+
+        mdy_output = self.tmpdir / "cleaned_ambiguity_mdy.csv"
+        mdy_result = self.run_cleaner(input_path, mdy_output, order="mdy")
+        self.assertEqual(mdy_result.returncode, 2)
+        self.assertEqual(mdy_result.stdout, b"")
+        self.assertIn("record 2", mdy_result.stderr.decode("utf-8"))
+        self.assertIn("13/02/2024", mdy_result.stderr.decode("utf-8"))
+        self.assertFalse(mdy_output.exists())
+
+        dmy_output = self.tmpdir / "cleaned_ambiguity_dmy.csv"
+        dmy_result = self.run_cleaner(input_path, dmy_output, order="dmy")
+        self.assertEqual(dmy_result.returncode, 0)
+        self.assertEqual(dmy_result.stderr, b"")
+        self.assertEqual(
+            self.read_output_records(dmy_output),
+            [DATE_HEADER, ["2024-02-13", "ambiguous"]],
+        )
+
+    # (label, order value or bare flag, rule, stderr fragments).
+    INVALID_ORDER_SCENARIOS = [
+        ("missing_value", None, "normalize-date",
+         ["--date-order", "expected one argument"]),
+        ("uppercase_dmy", "DMY", "normalize-date",
+         ["--date-order", "invalid choice", "DMY"]),
+        ("unknown_order", "ymd", "normalize-date",
+         ["--date-order", "invalid choice", "ymd"]),
+        ("with_trim_mdy", "mdy", "trim",
+         ["--date-order can only be used with --rule normalize-date"]),
+        ("with_trim_dmy", "dmy", "trim",
+         ["--date-order can only be used with --rule normalize-date"]),
+        ("with_normalize_null", "mdy", "normalize-null",
+         ["--date-order can only be used with --rule normalize-date"]),
+    ]
+
+    def assert_invalid_order_rejected(self, rows, *, tag, column="due_date"):
+        input_path = self.write_input(rows, tag=tag)
+        for label, order, rule, fragments in self.INVALID_ORDER_SCENARIOS:
+            with self.subTest(label=label):
+                output_path = self.tmpdir / f"cleaned_{tag}_{label}.csv"
+
+                result = self.run_cleaner(
+                    input_path, output_path, order=order, rule=rule,
+                    column=column,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                for fragment in fragments:
+                    self.assertIn(fragment, stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                # Parameter validation precedes every export.
+                self.assertFalse(output_path.exists())
+
+    def test_invalid_order_rejected_on_data_file(self):
+        self.assert_invalid_order_rejected(
+            self.ORDER_ROWS, tag="order_bad_data"
+        )
+
+    def test_invalid_order_rejected_on_header_only_file(self):
+        # A perfectly valid header-only input must not make any invalid
+        # parameter combination acceptable.
+        self.assert_invalid_order_rejected(
+            [DATE_HEADER], tag="order_bad_header"
+        )
+
+    def test_valid_order_on_header_only_exports_header(self):
+        input_path = self.write_input([DATE_HEADER], tag="order_header_ok")
+        output_path = self.tmpdir / "cleaned_order_header_ok.csv"
+
+        result = self.run_cleaner(input_path, output_path, order="mdy")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 0, "changed_cells": 0},
+        )
+        self.assertTrue(output_path.exists())
+        self.assertFalse(
+            output_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+        self.assertEqual(
+            self.read_output_records(output_path), [DATE_HEADER]
+        )
 
 
 if __name__ == "__main__":

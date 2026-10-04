@@ -11,6 +11,18 @@ normalize-null additionally accepts repeatable custom null markers:
         --column name --rule normalize-null \
         --null-marker MISSING --null-marker 待补
 
+normalize-date additionally accepts --date-order to choose how a slash
+date with the year last is read:
+
+    python csv_cleaner.py --input input.csv --output cleaned.csv \
+        --column due_date --rule normalize-date --date-order mdy
+
+    --date-order accepts only lowercase dmy and mdy; omitting it is the
+    same as dmy (DD/MM/YYYY). Under mdy the year-last slash date is read
+    as MM/DD/YYYY, with ambiguous fields settled by the chosen order and
+    no guessing or fallback. YYYY-MM-DD and YYYY/MM/DD stay
+    year-month-day under either order.
+
 On success prints a single JSON object to stdout, e.g.
     {"rows": 3, "changed_cells": 2}
 and exits 0. Any failure exits 2 with the reason on stderr and no output
@@ -41,8 +53,14 @@ NULL_MARKERS = frozenset({"null", "n/a"})
 
 # [0-9] rather than \d so only ASCII digits are accepted.
 DATE_ISO_RE = re.compile(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})$")
-DATE_DMY_RE = re.compile(r"^([0-9]{2})/([0-9]{2})/([0-9]{4})$")
+# A slash date whose four-digit year is last. The two leading fields are
+# day/month under dmy and month/day under mdy, never guessed.
+DATE_SLASH_YEAR_RE = re.compile(r"^([0-9]{2})/([0-9]{2})/([0-9]{4})$")
 DATE_YMD_SLASH_RE = re.compile(r"^([0-9]{4})/([0-9]{2})/([0-9]{2})$")
+
+# Accepted --date-order values: how to read a NN/NN/YYYY slash date.
+DATE_ORDERS = ("dmy", "mdy")
+DEFAULT_DATE_ORDER = "dmy"
 
 
 class InvalidDateError(ValueError):
@@ -76,16 +94,23 @@ def normalize_null(value, extra_markers=frozenset()):
     return value
 
 
-def normalize_date(value):
+def normalize_date(value, date_order=DEFAULT_DATE_ORDER):
     """Normalize an accepted date spelling to YYYY-MM-DD.
 
     After stripping both ends, an empty cell stays empty. Anything else
-    must be exactly YYYY-MM-DD, DD/MM/YYYY or YYYY/MM/DD with ASCII
-    digits, a four-digit year and two-digit month/day, and must be a
-    real proleptic Gregorian calendar date in years 0001-9999; the
-    result is always spelled YYYY-MM-DD. Internal whitespace, unpadded
-    numbers, time suffixes and null markers such as NULL or N/A are
-    invalid and raise InvalidDateError.
+    must be exactly YYYY-MM-DD, YYYY/MM/DD or a slash date with the
+    four-digit year last (NN/NN/YYYY), using ASCII digits, a four-digit
+    year and two-digit month/day, and must be a real proleptic Gregorian
+    calendar date in years 0001-9999; the result is always spelled
+    YYYY-MM-DD.
+
+    The year-last slash date is read by the explicit date_order only:
+    "dmy" reads it as DD/MM/YYYY and "mdy" as MM/DD/YYYY. Ambiguous
+    values follow that order with no guessing or fallback (under mdy
+    13/02/2024 means month 13 and is invalid). YYYY-MM-DD and
+    YYYY/MM/DD are always year-month-day under either order. Internal
+    whitespace, unpadded numbers, time suffixes and null markers such
+    as NULL or N/A are invalid and raise InvalidDateError.
     """
     stripped = value.strip()
     if not stripped:
@@ -98,9 +123,13 @@ def normalize_date(value):
         if match:
             year, month, day = (int(part) for part in match.groups())
         else:
-            match = DATE_DMY_RE.match(stripped)
+            match = DATE_SLASH_YEAR_RE.match(stripped)
             if match:
-                day, month, year = (int(part) for part in match.groups())
+                first, second, year = (int(part) for part in match.groups())
+                if date_order == "mdy":
+                    month, day = first, second
+                else:
+                    day, month = first, second
             else:
                 raise InvalidDateError(f"invalid date: {value!r}")
     try:
@@ -143,6 +172,13 @@ def parse_args(argv):
                              "normalize-null (may be repeated; the value "
                              "is stripped at both ends and compared "
                              "case-insensitively on ASCII letters only)")
+    parser.add_argument("--date-order", choices=DATE_ORDERS, default=None,
+                        metavar="ORDER",
+                        help="how to read a slash date with the year last "
+                             "for normalize-date: dmy (DD/MM/YYYY, the "
+                             "default when omitted) or mdy (MM/DD/YYYY); "
+                             "YYYY-MM-DD and YYYY/MM/DD stay year-month-day "
+                             "under either order")
     parser.add_argument("--include-changes", action="store_true",
                         help="add a changes array to the success summary "
                              "with one {record, column, before, after} "
@@ -198,6 +234,16 @@ def main(argv=None):
         extra_markers.add(ascii_lower(stripped_marker))
     if args.rule == "normalize-null":
         rule = partial(normalize_null, extra_markers=extra_markers)
+
+    # --date-order only governs normalize-date. argparse already rejects
+    # a missing value or anything other than the lowercase choices dmy /
+    # mdy (exit 2); an explicit order paired with another rule is rejected
+    # here, while omitting the option leaves every rule on its default.
+    if args.date_order is not None and args.rule != "normalize-date":
+        fail("--date-order can only be used with --rule normalize-date")
+    date_order = args.date_order or DEFAULT_DATE_ORDER
+    if args.rule == "normalize-date":
+        rule = partial(normalize_date, date_order=date_order)
 
     if os.path.abspath(args.input) == os.path.abspath(args.output):
         fail("output path must be different from the input path")
