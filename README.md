@@ -16,10 +16,29 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 
 | 参数 | 说明 |
 | --- | --- |
-| `--input` | 输入 CSV 路径（逗号分隔、UTF-8、允许 BOM，首条记录为表头；只读，不会被修改） |
+| `--input` | 输入 CSV 路径（分隔符由 `--delimiter` 显式指定，默认逗号；UTF-8、允许 BOM，首条记录为表头；只读，不会被修改） |
 | `--output` | 输出 CSV 路径（必须是不存在的新文件，且不能与输入指向同一文件；输出为无 BOM 的 UTF-8 CSV） |
 | `--column` | 要清洗的列名，与表头精确匹配（区分大小写），只选一列 |
 | `--rule` | 清洗规则，当前支持 `trim`（按 `str.strip` 语义去除单元格两端空白，保留内部空白）、`normalize-null`、`normalize-date` 与 `normalize-whitespace`（见下） |
+
+可选参数 `--delimiter NAME` 显式选择字段分隔符，仅接受小写名称 `comma`、
+`semicolon` 和 `tab`，分别表示逗号、分号和一个实际制表符；省略时等同 `comma`。
+所选分隔符同时用于读取输入和写出结果，不根据文件内容自动猜测（例如用
+`semicolon` 读取逗号文件时，逗号只是字段内容的一部分）。除分隔符外的既有
+CSV 规则不变：输入继续允许 UTF-8 BOM、输出为无 BOM 的 UTF-8，引号内的分隔符、
+双引号与真实换行继续作为字段内容保留，表头、记录顺序和非目标列的解析后字符串
+保持不变，引号内换行不计入记录序号。
+
+```bash
+python csv_cleaner.py --input sample.csv --output cleaned.csv \
+    --column name --rule trim --delimiter semicolon
+```
+
+例如 `sample.csv` 表头为 `name;note`，三条记录依次为 `" Alice ";"x;y"`、
+`"   ";ok` 和 `Bob;z`：以 `--delimiter semicolon` 对 `name` 列执行 `trim` 时，
+摘要为 `{"rows": 3, "changed_cells": 2}`，`--include-changes` 的 `changes`
+只按顺序列出记录 2 和 3，`before` 分别为 `" Alice "` 和 `"   "`、`after`
+分别为 `Alice` 和空字符串；导出文件仍用分号分隔，备注 `x;y` 仍是一个字段。
 
 `normalize-null`：先按 `str.strip` 去掉两端空白，若结果为空，或与 `NULL`、`N/A`
 做忽略 ASCII 字母大小写的完整匹配，则结果为空字符串；未命中时保留原字符串
@@ -83,7 +102,10 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 `--null-replacement` 缺值或与非 `normalize-null` 规则配合使用、
 `--date-order` 缺值、取值不是小写 `dmy`/`mdy` 或显式与 `trim`、
 `normalize-null`、`normalize-whitespace` 配合使用（仅含表头时同样拒绝无效参数；参数有效时仅含表头的
-文件正常导出表头）。
+文件正常导出表头）、
+`--delimiter` 缺值、为空或取值不是小写 `comma`/`semicolon`/`tab`
+（仅含表头时同样拒绝；合法参数下仅含表头的文件按同一分隔符导出表头，
+计数为零，开启明细时 `changes` 为 `[]`）。
 
 ### 示例
 
