@@ -23,6 +23,12 @@ date with the year last is read:
     no guessing or fallback. YYYY-MM-DD and YYYY/MM/DD stay
     year-month-day under either order.
 
+normalize-whitespace strips both ends and collapses every internal run
+of whitespace (judged by str.isspace) to one ASCII space:
+
+    python csv_cleaner.py --input input.csv --output cleaned.csv \
+        --column name --rule normalize-whitespace
+
 On success prints a single JSON object to stdout, e.g.
     {"rows": 3, "changed_cells": 2}
 and exits 0. Any failure exits 2 with the reason on stderr and no output
@@ -139,10 +145,26 @@ def normalize_date(value, date_order=DEFAULT_DATE_ORDER):
     return normalized.isoformat()
 
 
+def normalize_whitespace(value):
+    """Collapse whitespace to single ASCII spaces and strip both ends.
+
+    Whitespace is judged by str.isspace (space, tab, carriage return,
+    newline, ideographic space U+3000, ...): both ends are stripped and
+    every internal run of whitespace becomes one ASCII space. An empty
+    string stays empty and a whitespace-only string becomes empty. All
+    other characters and their order are preserved, including the
+    zero-width space U+200B, which str.isspace does not count as
+    whitespace. NULL / N/A text and date text are only
+    whitespace-normalized, never otherwise converted.
+    """
+    return " ".join(value.split())
+
+
 RULES = {
     "trim": str.strip,
     "normalize-null": normalize_null,
     "normalize-date": normalize_date,
+    "normalize-whitespace": normalize_whitespace,
 }
 
 

@@ -19,7 +19,7 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 | `--input` | 输入 CSV 路径（逗号分隔、UTF-8、允许 BOM，首条记录为表头；只读，不会被修改） |
 | `--output` | 输出 CSV 路径（必须是不存在的新文件，且不能与输入指向同一文件；输出为无 BOM 的 UTF-8 CSV） |
 | `--column` | 要清洗的列名，与表头精确匹配（区分大小写），只选一列 |
-| `--rule` | 清洗规则，当前支持 `trim`（按 `str.strip` 语义去除单元格两端空白，保留内部空白）、`normalize-null` 与 `normalize-date`（见下） |
+| `--rule` | 清洗规则，当前支持 `trim`（按 `str.strip` 语义去除单元格两端空白，保留内部空白）、`normalize-null`、`normalize-date` 与 `normalize-whitespace`（见下） |
 
 `normalize-null`：先按 `str.strip` 去掉两端空白，若结果为空，或与 `NULL`、`N/A`
 做忽略 ASCII 字母大小写的完整匹配，则结果为空字符串；未命中时保留原字符串
@@ -47,6 +47,13 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 非法日期：目标列出现非法日期时按记录顺序报告首个错误（含列名与记录序号），
 退出码为 2，不创建输出文件。
 
+`normalize-whitespace`：把单元格整理为单行且词间只有一个空格。空白按
+`str.isspace` 判定（含制表符、回车、换行及全角空格 U+3000 等）：去掉两端空白，
+内部每段连续空白替换为一个 ASCII 空格。空字符串不变，纯空白变为空字符串，其余
+字符及顺序保留（包括 `str.isspace` 不视为空白的零宽空格 U+200B）。`NULL`、`N/A`
+与日期文本只处理空白，不做额外转换。该规则与 `--null-marker`、`--date-order`
+不兼容：显式搭配任一参数按参数错误处理（退出码 2，仅含表头时同样拒绝）。
+
 成功时退出码为 0，标准输出只有一个 JSON 对象，例如 `{"rows": 3, "changed_cells": 2}`：
 `rows` 为数据记录数（不含表头），`changed_cells` 为清理前后字符串发生变化的单元格数。
 仅含表头的文件会成功导出表头，两项计数均为 0。
@@ -64,7 +71,7 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 输入不存在、UTF-8 解码失败、读写失败、输出已存在或与输入同路径（已有内容保留不变）、
 `--null-marker` 缺值、去空白后为空或与非 `normalize-null` 规则配合使用、
 `--date-order` 缺值、取值不是小写 `dmy`/`mdy` 或显式与 `trim`、
-`normalize-null` 配合使用（仅含表头时同样拒绝无效参数；参数有效时仅含表头的
+`normalize-null`、`normalize-whitespace` 配合使用（仅含表头时同样拒绝无效参数；参数有效时仅含表头的
 文件正常导出表头）。
 
 ### 示例

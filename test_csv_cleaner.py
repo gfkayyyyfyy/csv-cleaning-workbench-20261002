@@ -168,6 +168,21 @@ The tests exercise only the documented public CLI:
   reported -- with and without the details switch, proving the chosen
   order never bypasses date validation. The input bytes stay unchanged
   and no output or extra file appears in any preview.
+* normalize-whitespace: the name,note acceptance sample has four records
+  whose names parse as " Alice  Smith ", a string holding only a tab and
+  an ideographic space, "Bob Lee" and an empty string, with a quoted
+  real newline inside the first record's note. The cleaned names are
+  "Alice Smith", "", "Bob Lee" and ""; the summary reports rows 4 /
+  changed_cells 2, and with --include-changes only records 2 and 3
+  appear in record order with the original values in before. NULL, N/A
+  and date text are only whitespace-normalized, never converted, and
+  whitespace-only cells become empty while U+200B zero-width spaces are
+  preserved. A --dry-run preview prints the identical summary without
+  creating the output file or its missing parent directory; a
+  header-only input reports both counts at 0 and an empty changes array.
+  Pairing the rule with --null-marker or --date-order fails with exit
+  code 2, empty stdout and the incompatible-option reason on stderr,
+  with no output file -- including for a header-only input.
 * command-line argument validation: one legal UTF-8 sample (header
   name,note, a single record whose name parses as " Alice " and whose
   note parses as "x,y") isolates the argument errors. Removing any one
@@ -3420,6 +3435,306 @@ class DryRunDateOrderTests(unittest.TestCase):
                 self.assertEqual(input_path.read_bytes(), original_bytes)
 
         self.assert_workspace_holds_only([input_path.name])
+
+
+class NormalizeWhitespaceCliTests(unittest.TestCase):
+    """Coverage for the normalize-whitespace rule.
+
+    Every test goes through the documented public CLI against small CSV
+    files in a private temporary directory; results are judged on parsed
+    CSV fields and the parsed JSON object, so equivalent quoting styles
+    and JSON key order are irrelevant.
+    """
+
+    # The acceptance sample: name,note header plus four data records.
+    # The names parse as " Alice  Smith " (internal runs collapse, ends
+    # trimmed), a string holding only a tab and an ideographic space
+    # (U+3000, whitespace under str.isspace, so the cell becomes empty),
+    # "Bob Lee" (already single-spaced, not a change) and an empty
+    # string. The first record's note carries a quoted real newline,
+    # which must not disturb record numbering (the header is record 1).
+    WS_ROWS = [
+        HEADER,
+        [" Alice  Smith ", "first line\nstill first"],
+        ["\t　", "x,y"],          # tab + U+3000: whitespace-only -> ""
+        ["Bob Lee", 'he said "ok"'],
+        ["", "plain"],
+    ]
+    WS_EXPECTED_NAMES = ["Alice Smith", "", "Bob Lee", ""]
+    WS_EXPECTED_CHANGES = [
+        {"record": 2, "column": "name",
+         "before": " Alice  Smith ", "after": "Alice Smith"},
+        {"record": 3, "column": "name",
+         "before": "\t　", "after": ""},
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag):
+        data = encode_csv(rows, bom=bom)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *,
+                    include_changes=False, dry_run=False, extra_args=(),
+                    column="name"):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", column,
+            "--rule", "normalize-whitespace",
+        ]
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        argv.extend(extra_args)
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def assert_workspace_holds_only(self, names):
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()), sorted(names)
+        )
+
+    def test_export_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "ws_bom" if bom else "ws_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.WS_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(input_path, output_path)
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing non-whitespace.
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 4, "changed_cells": 2},
+                )
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                output_rows = self.read_output_records(output_path)
+                # Header and record order are unchanged.
+                self.assertEqual(output_rows[0], HEADER)
+                self.assertEqual(len(output_rows), 5)
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    self.WS_EXPECTED_NAMES,
+                )
+                # The note column is never cleaned: the embedded newline,
+                # comma and double quotes round-trip exactly.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in self.WS_ROWS],
+                )
+                # The input file is opened read-only: exact bytes remain.
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_changes_detail_lists_records_2_and_3(self):
+        # With --include-changes only the two changed cells appear, in
+        # record order, with the parsed original values (including the
+        # tab and the ideographic space) preserved in before. The quoted
+        # newline in record 2's note does not shift the record numbers.
+        input_path, original_bytes = self.write_input(
+            self.WS_ROWS, bom=False, tag="ws_changes"
+        )
+        output_path = self.tmpdir / "cleaned_ws_changes.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path, include_changes=True
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        summary = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(
+            summary,
+            {"rows": 4, "changed_cells": 2,
+             "changes": self.WS_EXPECTED_CHANGES},
+        )
+        self.assertEqual(
+            len(summary["changes"]), summary["changed_cells"]
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_whitespace_only_cells_and_zero_width_space(self):
+        # Tabs, carriage returns, newlines and ideographic spaces are all
+        # whitespace under str.isspace: a whitespace-only cell becomes
+        # empty and internal runs collapse to one ASCII space. The
+        # zero-width space U+200B is not whitespace, so it survives
+        # verbatim, as do NULL / N/A / date text (whitespace only, no
+        # other conversion).
+        cells = [
+            ("\t\r\n　", ""),                     # whitespace-only -> ""
+            ("a\tb\rc\nd　e", "a b c d e"),       # runs -> one space
+            ("​", "​"),                     # U+200B kept
+            ("　N/A　", "N/A"),                   # marker text kept as text
+            (" 2024-02-29 ", "2024-02-29"),       # date text kept as text
+            ("NULL", "NULL"),                     # already clean: no change
+        ]
+        rows = [HEADER] + [[value, "note"] for value, _ in cells]
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag="ws_boundaries"
+        )
+        output_path = self.tmpdir / "cleaned_ws_boundaries.csv"
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 6, "changed_cells": 4},
+        )
+        self.assertEqual(
+            [row[0] for row in self.read_output_records(output_path)[1:]],
+            [expected for _, expected in cells],
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_dry_run_preview_matches_export_and_creates_nothing(self):
+        # The preview prints the identical summary as a real export
+        # (with and without --include-changes) but creates neither the
+        # output file nor its missing parent directory.
+        input_path, original_bytes = self.write_input(
+            self.WS_ROWS, bom=False, tag="ws_preview"
+        )
+        missing_dir = self.tmpdir / "nodir"
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                tag = "with" if include_changes else "without"
+                preview_path = missing_dir / f"preview_{tag}.csv"
+                export_path = self.tmpdir / f"cleaned_export_{tag}.csv"
+
+                preview = self.run_cleaner(
+                    input_path, preview_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+                export = self.run_cleaner(
+                    input_path, export_path,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(preview.returncode, 0)
+                self.assertEqual(preview.stderr, b"")
+                self.assertEqual(export.returncode, 0)
+                self.assertEqual(export.stderr, b"")
+                self.assertEqual(preview.stdout, export.stdout)
+                summary = json.loads(preview.stdout.decode("utf-8"))
+                expected = {"rows": 4, "changed_cells": 2}
+                if include_changes:
+                    expected["changes"] = self.WS_EXPECTED_CHANGES
+                self.assertEqual(summary, expected)
+                self.assertFalse(preview_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(
+                    [row[0] for row in
+                     self.read_output_records(export_path)[1:]],
+                    self.WS_EXPECTED_NAMES,
+                )
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        self.assert_workspace_holds_only(
+            [input_path.name,
+             "cleaned_export_with.csv", "cleaned_export_without.csv"]
+        )
+
+    def test_header_only_reports_zero_counts(self):
+        input_path, original_bytes = self.write_input(
+            [HEADER], bom=False, tag="ws_header_only"
+        )
+        output_path = self.tmpdir / "cleaned_ws_header_only.csv"
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, include_changes=include_changes
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                expected = {"rows": 0, "changed_cells": 0}
+                if include_changes:
+                    expected["changes"] = []
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")), expected
+                )
+                self.assertEqual(
+                    self.read_output_records(output_path), [HEADER]
+                )
+                output_path.unlink()
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    # (label, extra args, stderr fragments).
+    INCOMPATIBLE_SCENARIOS = [
+        ("null_marker", ["--null-marker", "MISSING"],
+         ["--null-marker can only be used with --rule normalize-null"]),
+        ("date_order", ["--date-order", "mdy"],
+         ["--date-order can only be used with --rule normalize-date"]),
+    ]
+
+    def assert_incompatible_options_rejected(self, rows, *, tag):
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag=tag
+        )
+        for label, extra_args, fragments in self.INCOMPATIBLE_SCENARIOS:
+            for include_changes in (False, True):
+                with self.subTest(label=label,
+                                  include_changes=include_changes):
+                    output_path = (
+                        self.tmpdir / f"cleaned_{tag}_{label}.csv"
+                    )
+                    self.assertFalse(output_path.exists())
+
+                    result = self.run_cleaner(
+                        input_path, output_path,
+                        include_changes=include_changes,
+                        extra_args=extra_args,
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b"")
+                    stderr_text = result.stderr.decode("utf-8")
+                    for fragment in fragments:
+                        self.assertIn(fragment, stderr_text)
+                    self.assertNotIn("Traceback", stderr_text)
+                    self.assertFalse(output_path.exists())
+                    self.assertEqual(
+                        input_path.read_bytes(), original_bytes
+                    )
+
+    def test_incompatible_options_rejected_on_data_file(self):
+        self.assert_incompatible_options_rejected(
+            self.WS_ROWS, tag="ws_bad_data"
+        )
+
+    def test_incompatible_options_rejected_on_header_only_file(self):
+        # A perfectly valid header-only input must not make the invalid
+        # parameter combinations acceptable.
+        self.assert_incompatible_options_rejected(
+            [HEADER], tag="ws_bad_header"
+        )
 
 
 if __name__ == "__main__":
