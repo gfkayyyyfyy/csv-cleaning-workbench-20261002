@@ -33,6 +33,16 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 默认的空值、`NULL`、`N/A` 处理始终保留。标记值在 `str.strip` 后为空、缺值，或
 与 `trim`、`normalize-date` 配合使用时，按参数错误处理（退出码 2）。
 
+可选参数 `--null-replacement TEXT` 仅在 `--rule normalize-null` 时可用，把本次运行
+中原本会被该规则转为空字符串的单元格（原本为空或纯空白的值、默认 `NULL` 与 `N/A`，
+以及 `--null-marker` 追加的整值标记命中项）改写为参数原文。匹配方式与未提供该参数
+时完全一致，未命中的值连同两端空白原样保留；替代文本不去空白、不改大小写、写出后
+不再参与标记识别，空字符串与纯空白文本也允许使用。省略该参数时保持既有行为（转为
+空字符串）。摘要仍只统计实际字符串变化：替代文本与原值相同的单元格不计入
+`changed_cells`，开启 `--include-changes` 时也不收录。`--null-replacement` 缺值，或
+与 `trim`、`normalize-date`、`normalize-whitespace` 配合使用时，按参数错误处理
+（退出码 2，仅含表头时同样拒绝）。
+
 `normalize-date`：先按 `str.strip` 去掉两端空白，空字符串或纯空白输出为空；其余
 接受 `YYYY-MM-DD`、`YYYY/MM/DD` 与四位年份在末尾的斜杠日期三种写法（同一列可
 混用），要求 ASCII 数字、四位年份、两位月日及与写法对应的分隔符（`-` 或 `/`），
@@ -70,6 +80,7 @@ python csv_cleaner.py --input input.csv --output cleaned.csv --column name --rul
 日期（报错含列名与从表头记为第 1 条开始的记录序号，引号内换行不计入）、CSV 无法解析、
 输入不存在、UTF-8 解码失败、读写失败、输出已存在或与输入同路径（已有内容保留不变）、
 `--null-marker` 缺值、去空白后为空或与非 `normalize-null` 规则配合使用、
+`--null-replacement` 缺值或与非 `normalize-null` 规则配合使用、
 `--date-order` 缺值、取值不是小写 `dmy`/`mdy` 或显式与 `trim`、
 `normalize-null`、`normalize-whitespace` 配合使用（仅含表头时同样拒绝无效参数；参数有效时仅含表头的
 文件正常导出表头）。

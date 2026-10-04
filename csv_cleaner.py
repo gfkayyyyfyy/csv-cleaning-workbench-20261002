@@ -11,6 +11,21 @@ normalize-null additionally accepts repeatable custom null markers:
         --column name --rule normalize-null \
         --null-marker MISSING --null-marker 待补
 
+normalize-null also accepts --null-replacement TEXT to substitute the
+given text for every cell the rule would otherwise turn into an empty
+string:
+
+    python csv_cleaner.py --input input.csv --output cleaned.csv \
+        --column name --rule normalize-null --null-replacement 未知
+
+The replacement is written verbatim: it is not stripped, not
+case-folded and never re-matched against the null markers, and an
+empty or whitespace-only replacement is allowed. Omitting the option
+keeps the default empty-string behavior. Cells whose value does not
+match a marker are kept byte-for-byte either way, and a cell only
+counts as changed when the replacement differs from its original
+value.
+
 normalize-date additionally accepts --date-order to choose how a slash
 date with the year last is read:
 
@@ -80,23 +95,25 @@ def ascii_lower(text):
     )
 
 
-def normalize_null(value, extra_markers=frozenset()):
-    """Normalize null markers to an empty string.
+def normalize_null(value, extra_markers=frozenset(), replacement=""):
+    """Normalize null markers to the replacement text (empty by default).
 
-    After stripping both ends, the cell becomes empty when the result is
+    After stripping both ends, the cell is replaced when the result is
     empty or matches NULL / N/A (or any of the given extra markers)
     case-insensitively with respect to ASCII letters. Anything else is
     returned byte-for-byte, including its surrounding whitespace (e.g.
     "NULLABLE" is not a marker). Extra markers are compared after
     str.strip() themselves; duplicate markers collapse into one match but
-    never inflate the change count.
+    never inflate the change count. The replacement is used verbatim: it
+    is not stripped, not case-folded and never re-matched against the
+    markers, and an empty or whitespace-only replacement is allowed.
     """
     stripped = value.strip()
     if not stripped:
-        return ""
+        return replacement
     lowered = ascii_lower(stripped)
     if lowered in NULL_MARKERS or lowered in extra_markers:
-        return ""
+        return replacement
     return value
 
 
@@ -194,6 +211,15 @@ def parse_args(argv):
                              "normalize-null (may be repeated; the value "
                              "is stripped at both ends and compared "
                              "case-insensitively on ASCII letters only)")
+    parser.add_argument("--null-replacement", default=None,
+                        metavar="TEXT",
+                        help="replacement text for normalize-null: every "
+                             "cell the rule would turn into an empty "
+                             "string is written as TEXT instead, verbatim "
+                             "(not stripped, not case-folded, never "
+                             "re-matched; empty and whitespace-only text "
+                             "is allowed); omitting it keeps the default "
+                             "empty-string behavior")
     parser.add_argument("--date-order", choices=DATE_ORDERS, default=None,
                         metavar="ORDER",
                         help="how to read a slash date with the year last "
@@ -254,8 +280,16 @@ def main(argv=None):
             fail("--null-marker requires a value that is non-empty "
                  "after stripping surrounding whitespace")
         extra_markers.add(ascii_lower(stripped_marker))
+
+    # --null-replacement is only meaningful for normalize-null. argparse
+    # already rejects a missing value (exit 2); any text is otherwise
+    # accepted verbatim, including empty and whitespace-only strings.
+    if args.null_replacement is not None and args.rule != "normalize-null":
+        fail("--null-replacement can only be used with "
+             "--rule normalize-null")
     if args.rule == "normalize-null":
-        rule = partial(normalize_null, extra_markers=extra_markers)
+        rule = partial(normalize_null, extra_markers=extra_markers,
+                       replacement=args.null_replacement or "")
 
     # --date-order only governs normalize-date. argparse already rejects
     # a missing value or anything other than the lowercase choices dmy /

@@ -60,6 +60,24 @@ The tests exercise only the documented public CLI:
   reason on stderr, no Python traceback, no output file and untouched
   input bytes -- including for a header-only input; a header-only input
   with valid markers exports just the header with both counts at 0.
+* --null-replacement: the optional replacement text for normalize-null
+  is written verbatim into every cell the rule would otherwise turn
+  into an empty string (blank or whitespace-only values, the default
+  NULL / N/A markers and any --null-marker additions), without
+  stripping, case-folding or re-matching against the markers; empty and
+  whitespace-only replacements are allowed, and omitting the option
+  keeps the default empty-string behavior. The acceptance sample (names
+  " NULL ", 待补, 未知, " Bob " with marker 待补 and replacement 未知)
+  reports rows 4 / changed_cells 2 with only records 2 and 3 listed
+  under --include-changes (a cell whose original value already equals
+  the replacement is not a change), identically under --dry-run (which
+  creates nothing) and a real BOM-free export. A missing replacement
+  value, or pairing the option with trim / normalize-date /
+  normalize-whitespace, fails with exit code 2, empty stdout, the
+  option and reason on stderr, no Python traceback and no output file
+  -- including for a header-only input; a header-only input with a
+  valid replacement exports just the header with both counts at 0 and
+  an empty changes array.
 * invalid inputs (zero-byte file, BOM-only file, empty and duplicate
   header column names, an unterminated quoted field, invalid UTF-8 bytes
   and a record with too many fields following a record containing a
@@ -1306,6 +1324,270 @@ class NullMarkerCliTests(unittest.TestCase):
         # invalid parameter combinations acceptable.
         self.assert_invalid_markers_rejected(
             [HEADER], bom=False, input_tag="marker_bad_header"
+        )
+
+
+class NullReplacementCliTests(unittest.TestCase):
+    """Coverage for the --null-replacement option of normalize-null.
+
+    The option substitutes its verbatim text for every cell the rule
+    would otherwise turn into an empty string. Every test goes through
+    the public CLI with small CSV files prepared in a temporary
+    directory; results are judged on parsed CSV fields and the parsed
+    JSON object, so equivalent quoting styles and JSON key order are
+    irrelevant.
+    """
+
+    # Acceptance sample: the name values are " NULL ", 待补, 未知 and
+    # " Bob "; with the custom marker 待补 and the replacement 未知 the
+    # first two names are substituted, the third already equals the
+    # replacement text without matching a marker (not a change), and the
+    # last is kept with its surrounding spaces.
+    REPLACEMENT_ROWS = [
+        HEADER,
+        [" NULL ", "a"],
+        ["待补", "b"],
+        ["未知", "c"],
+        [" Bob ", "d"],
+    ]
+    REPLACEMENT_EXPECTED_NAMES = ["未知", "未知", "未知", " Bob "]
+    REPLACEMENT_EXPECTED_CHANGES = [
+        {"record": 2, "column": "name", "before": " NULL ", "after": "未知"},
+        {"record": 3, "column": "name", "before": "待补", "after": "未知"},
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag):
+        data = encode_csv(rows, bom=bom)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, replacement,
+                    rule="normalize-null", column="name",
+                    markers=(), include_changes=False, dry_run=False):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", column,
+            "--rule", rule,
+        ]
+        for marker in markers:
+            argv += ["--null-marker", marker]
+        if replacement is not None:
+            argv += ["--null-replacement", replacement]
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def test_replacement_dry_run_and_export_match_acceptance(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "repl_bom" if bom else "repl_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.REPLACEMENT_ROWS, bom=bom, tag=tag
+                )
+                preview_path = self.tmpdir / f"preview_{tag}.csv"
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+
+                preview = self.run_cleaner(
+                    input_path, preview_path,
+                    markers=["待补"], replacement="未知",
+                    include_changes=True, dry_run=True,
+                )
+
+                self.assertEqual(preview.returncode, 0)
+                self.assertEqual(preview.stderr, b"")
+                self.assertEqual(
+                    json.loads(preview.stdout.decode("utf-8")),
+                    {"rows": 4, "changed_cells": 2,
+                     "changes": self.REPLACEMENT_EXPECTED_CHANGES},
+                )
+                # The preview creates neither the file nor anything else.
+                self.assertFalse(preview_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    markers=["待补"], replacement="未知",
+                    include_changes=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # The real export prints the identical summary.
+                self.assertEqual(result.stdout, preview.stdout)
+
+                raw_output = output_path.read_bytes()
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                output_rows = self.read_output_records(output_path)
+                self.assertEqual(output_rows[0], HEADER)
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    self.REPLACEMENT_EXPECTED_NAMES,
+                )
+                # The note column is never cleaned.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in self.REPLACEMENT_ROWS],
+                )
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_replacement_is_verbatim_and_never_rematched(self):
+        # A replacement that is itself a null marker is written as-is and
+        # not re-normalized; surrounding whitespace and letter case in the
+        # replacement survive untouched.
+        input_path, original_bytes = self.write_input(
+            [HEADER, [" n/A ", "x"], ["NULL", "y"], ["keep", "z"]],
+            bom=False, tag="repl_verbatim",
+        )
+        output_path = self.tmpdir / "cleaned_repl_verbatim.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path, replacement=" Null "
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 3, "changed_cells": 2},
+        )
+        self.assertEqual(
+            [row[0] for row in self.read_output_records(output_path)[1:]],
+            [" Null ", " Null ", "keep"],
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_empty_and_whitespace_only_replacements_are_allowed(self):
+        # An empty replacement reproduces the default behavior; a
+        # whitespace-only replacement is written verbatim. A cell whose
+        # original value already equals the replacement is not a change.
+        for replacement, expected_names, changed in (
+            ("", ["", "keep"], 1),
+            ("  ", ["  ", "keep"], 1),
+            ("keep", ["keep", "keep"], 1),
+        ):
+            with self.subTest(replacement=replacement):
+                tag = f"repl_edge_{changed}_{len(replacement)}"
+                input_path, _ = self.write_input(
+                    [HEADER, [" NULL ", "a"], ["keep", "b"]],
+                    bom=False, tag=tag,
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+
+                result = self.run_cleaner(
+                    input_path, output_path, replacement=replacement
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 2, "changed_cells": changed},
+                )
+                self.assertEqual(
+                    [row[0]
+                     for row in self.read_output_records(output_path)[1:]],
+                    expected_names,
+                )
+
+    def test_valid_replacement_header_only_file(self):
+        input_path, original_bytes = self.write_input(
+            [HEADER], bom=False, tag="repl_header_only"
+        )
+        output_path = self.tmpdir / "cleaned_repl_header_only.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            replacement="未知", include_changes=True,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 0, "changed_cells": 0, "changes": []},
+        )
+        self.assertEqual(self.read_output_records(output_path), [HEADER])
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    # (label, replacement argv (None = option omitted entirely,
+    # "MISSING" = bare flag with no value), rule, stderr fragments).
+    INVALID_REPLACEMENT_SCENARIOS = [
+        ("missing_value", "MISSING", "normalize-null",
+         ["--null-replacement", "expected one argument"]),
+        ("with_trim", "未知", "trim",
+         ["--null-replacement can only be used with "
+          "--rule normalize-null"]),
+        ("with_normalize_date", "未知", "normalize-date",
+         ["--null-replacement can only be used with "
+          "--rule normalize-null"]),
+        ("with_normalize_whitespace", "未知", "normalize-whitespace",
+         ["--null-replacement can only be used with "
+          "--rule normalize-null"]),
+    ]
+
+    def assert_invalid_replacement_rejected(self, rows, *, input_tag):
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag=input_tag
+        )
+        scenarios = self.INVALID_REPLACEMENT_SCENARIOS
+        for label, replacement, rule, fragments in scenarios:
+            with self.subTest(label=label):
+                output_path = self.tmpdir / f"cleaned_{input_tag}_{label}.csv"
+                self.assertFalse(output_path.exists())
+
+                argv = [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--input", str(input_path),
+                    "--output", str(output_path),
+                    "--column", "name",
+                    "--rule", rule,
+                    "--null-replacement",
+                ]
+                if replacement != "MISSING":
+                    argv.append(replacement)
+                result = subprocess.run(
+                    argv, cwd=str(self.tmpdir), capture_output=True
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                for fragment in fragments:
+                    self.assertIn(fragment, stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_invalid_replacement_rejected_on_data_file(self):
+        self.assert_invalid_replacement_rejected(
+            self.REPLACEMENT_ROWS, input_tag="repl_bad_data"
+        )
+
+    def test_invalid_replacement_rejected_on_header_only_file(self):
+        # A perfectly valid header-only input must not make any of the
+        # invalid parameter combinations acceptable.
+        self.assert_invalid_replacement_rejected(
+            [HEADER], input_tag="repl_bad_header"
         )
 
 
