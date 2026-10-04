@@ -17,11 +17,17 @@ The tests exercise only the documented public CLI:
   is preserved verbatim including surrounding and internal whitespace.
   Also covers the header-only summary and case-sensitive column lookup.
 * normalize-date: blank cells become empty, real Gregorian dates spelled
-  YYYY-MM-DD, DD/MM/YYYY or YYYY/MM/DD (ASCII digits, zero-padded; the
-  three spellings may be mixed in one column) normalize to
-  YYYY-MM-DD, and the first invalid date (internal whitespace, unpadded
-  numbers, time suffixes, fullwidth digits, NULL/N/A text, nonexistent
-  calendar dates) fails by CSV record number without exporting anything.
+  YYYY-MM-DD, DD/MM/YYYY, YYYY/MM/DD or YYYY.MM.DD (ASCII digits,
+  zero-padded; the four spellings may be mixed in one column) normalize
+  to YYYY-MM-DD, and the first invalid date (internal whitespace,
+  unpadded numbers, mixed separators, time suffixes, fullwidth digits,
+  NULL/N/A text, nonexistent calendar dates) fails by CSV record number
+  without exporting anything. YYYY.MM.DD is always year-month-day with
+  two English periods (its acceptance file is due_date,note with
+  " 2024.02.29 ", 0001.01.01, 2024-03-01 and an empty cell: rows 4 /
+  changed_cells 2, only records 2 and 3 listed); a non-leap
+  2023.02.29 at record 3 fails the run and the --dry-run preview alike,
+  leaving no output file behind.
   A year-boundary regression pins the documented 0001-9999 range: both
   endpoints convert (the low year keeps four digits, including the
   0001/01/01 slash spelling), 2000-02-29 is a century leap day in
@@ -36,11 +42,12 @@ The tests exercise only the documented public CLI:
   February 30, both rejected at the first offending record number (the
   header is record 1, a quoted newline does not advance the number),
   while the same 13/02/2024 is a clean 2024-02-13 under dmy.
-  YYYY-MM-DD and YYYY/MM/DD stay year-month-day under either order,
-  blank cells stay empty, the summary keeps its two-key shape and the
-  --include-changes entries list the raw before value and the order's
-  after value in record order. A missing or non-choice --date-order
-  value (DMY, ymd), or an explicit order paired with trim /
+  YYYY-MM-DD, YYYY/MM/DD and YYYY.MM.DD stay year-month-day under
+  either order (a year-last dot value such as 03.02.2024 is rejected
+  under both), blank cells stay empty, the summary keeps its two-key
+  shape and the --include-changes entries list the raw before value
+  and the order's after value in record order. A missing or non-choice
+  --date-order value (DMY, ymd), or an explicit order paired with trim /
   normalize-null, fails with exit code 2, empty stdout, the option and
   reason on stderr, no Python traceback and no output file -- including
   for a header-only input; a valid order on a header-only input exports
@@ -400,6 +407,39 @@ MIXED_DATE_EXPECTED_CHANGES_DETAIL = [
      "before": "   ", "after": ""},
 ]
 
+# Dot-spelling sample mirroring the acceptance dates.csv: the new
+# YYYY.MM.DD spelling is mixed with an already-ISO date and an empty
+# cell. The first value is padded at both ends; only records 2 and 3
+# change (record 4 is already ISO and record 5 already empty).
+DOT_DATE_ROWS = [
+    DATE_HEADER,
+    [" 2024.02.29 ", "a"],          # YYYY.MM.DD, padded ends -> 2024-02-29
+    ["0001.01.01", "b"],            # year 0001 endpoint -> 0001-01-01
+    ["2024-03-01", "c"],            # already ISO: not a change
+    ["", "d"],                      # already empty: not a change
+]
+DOT_DATE_EXPECTED_DATES = [
+    "2024-02-29", "0001-01-01", "2024-03-01", "",
+]
+DOT_DATE_EXPECTED_CHANGED = 2
+DOT_DATE_EXPECTED_CHANGES_DETAIL = [
+    {"record": 2, "column": "due_date",
+     "before": " 2024.02.29 ", "after": "2024-02-29"},
+    {"record": 3, "column": "due_date",
+     "before": "0001.01.01", "after": "0001-01-01"},
+]
+
+# Same sample with record 3's dot date changed to the non-leap
+# 2023.02.29: the run must abort at record 3 (the header is record 1)
+# and never reach the later records, leaving no output file behind.
+DOT_INVALID_ROWS = [
+    DATE_HEADER,
+    [" 2024.02.29 ", "a"],
+    ["2023.02.29", "b"],
+    ["2024-03-01", "c"],
+    ["", "d"],
+]
+
 # Cell values that must all be rejected as invalid dates.
 INVALID_DATE_VALUES = [
     "31/02/2024",        # February never has 31 days
@@ -421,6 +461,23 @@ INVALID_DATE_VALUES = [
     "2024 /02/29",       # internal whitespace
     "2024/02/29/x",      # trailing component
     "2024/02",           # missing day
+    # YYYY.MM.DD spelling: same strictness, two English periods only,
+    # always year-month-day and independent of --date-order.
+    "2023.02.29",        # 2023 is not a leap year
+    "2024.2.29",         # unpadded month
+    "2024.02.1",         # unpadded day
+    "0000.01.01",        # year 0000 is outside 0001-9999
+    "２０２４.０２.２９",   # fullwidth digits are not ASCII digits
+    "2024.02.29 10:30",  # time suffix
+    "2024 .02.29",       # internal whitespace
+    "2024.02.29/x",      # trailing component
+    "2024.02",           # missing day
+    "01.02.2024",        # dots are only accepted as YYYY.MM.DD, year first
+    "2024-02.29",        # mixed separator: dash then dot
+    "2024/02.29",        # mixed separator: slash then dot
+    "2024.02-29",        # mixed separator: dot then dash
+    "2024。02。29",        # ideographic full stop, not an English period
+    "2024.13.01",        # month 13 does not exist
 ]
 
 # Year-boundary and century-leap regression for the documented 0001-9999
@@ -453,6 +510,8 @@ BOUNDARY_INVALID_VALUES = [
     "29/02/2100",   # 2100 is likewise not a leap year
     "0000-01-01",   # year 0000 is one below the documented range
     "01/01/10000",  # a five-digit year is one above the documented range
+    "1900.02.29",   # same non-leap century in the YYYY.MM.DD spelling
+    "10000.01.01",  # a five-digit dot year is one above the range
 ]
 
 # --null-marker sample: five repeatable custom markers, two of which
@@ -1040,6 +1099,181 @@ class CsvCleanerCliTests(unittest.TestCase):
         self.assertEqual(
             [row[0] for row in self.read_output_records(output_path)[1:]],
             ["0001-01-01", "9999-12-31"],
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_dot_spelling_acceptance(self):
+        # The documented YYYY.MM.DD acceptance file: a padded dot leap
+        # day at record 2 and 0001.01.01 at record 3 change, the
+        # already-ISO record 4 and empty record 5 do not. The run exits
+        # 0 with rows 4 / changed_cells 2, the header, record order and
+        # parsed note text are untouched, and the export is BOM-free
+        # even when the input carries a BOM.
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "date_dot_bom" if bom else "date_dot_nobom"
+                input_path, original_bytes = self.write_input(
+                    DOT_DATE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path,
+                    rule="normalize-date", column="due_date",
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 4,
+                     "changed_cells": DOT_DATE_EXPECTED_CHANGED},
+                )
+
+                self.assertTrue(output_path.exists())
+                self.assertFalse(
+                    output_path.read_bytes().startswith(codecs.BOM_UTF8)
+                )
+                output_rows = self.read_output_records(output_path)
+                self.assertEqual(output_rows[0], DATE_HEADER)
+                self.assertEqual(len(output_rows), 5)
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    DOT_DATE_EXPECTED_DATES,
+                )
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in DOT_DATE_ROWS],
+                )
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_dot_spelling_changes_detail(self):
+        # With --include-changes only records 2 and 3 are listed in
+        # record order; before keeps the parsed original value (spaces
+        # and all) and after holds the converted ISO date.
+        input_path, _ = self.write_input(
+            DOT_DATE_ROWS, bom=False, tag="date_dot_changes"
+        )
+        output_path = self.tmpdir / "cleaned_date_dot_changes.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+            include_changes=True,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        summary = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(summary["rows"], 4)
+        self.assertEqual(
+            summary["changed_cells"], DOT_DATE_EXPECTED_CHANGED
+        )
+        self.assertEqual(
+            summary["changes"], DOT_DATE_EXPECTED_CHANGES_DETAIL
+        )
+
+    def test_normalize_date_dot_year_endpoints(self):
+        # The 0001.01.01 spelling converts to 0001-01-01 and keeps four
+        # digits through the ISO output; 9999.12.31 is the upper
+        # endpoint. Padded ends are stripped before matching.
+        rows = [
+            DATE_HEADER,
+            [" 0001.01.01 ", "x,y"],
+            ["9999.12.31", "end"],
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag="date_dot_endpoints"
+        )
+        output_path = self.tmpdir / "cleaned_date_dot_endpoints.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            {"rows": 2, "changed_cells": 2},
+        )
+        self.assertEqual(
+            [row[0] for row in self.read_output_records(output_path)[1:]],
+            ["0001-01-01", "9999-12-31"],
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_dot_non_leap_fails_by_record_number(self):
+        # Record 3 carries the impossible 2023.02.29 (2023 is not a
+        # leap year); it must be reported as record 3 with the original
+        # value quoted, the later valid record 4 must not be exported
+        # ahead of it, and no output file may be left behind.
+        input_path, original_bytes = self.write_input(
+            DOT_INVALID_ROWS, bom=False, tag="date_dot_invalid"
+        )
+        output_path = self.tmpdir / "cleaned_date_dot_invalid.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        stderr_text = result.stderr.decode("utf-8")
+        self.assertIn("invalid date", stderr_text)
+        self.assertIn("due_date", stderr_text)
+        self.assertIn("record 3", stderr_text)
+        # The message quotes the first offending value verbatim.
+        self.assertIn("2023.02.29", stderr_text)
+        # Only the first invalid date is reported; the cleanable record
+        # 2 and the records after the failure produce no output.
+        self.assertNotIn("record 4", stderr_text)
+        self.assertNotIn("record 5", stderr_text)
+        self.assertNotIn("Traceback", stderr_text)
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_normalize_date_dot_mixes_with_all_other_spellings(self):
+        # All four spellings plus a blank cell share one column: the
+        # dot and slash values change, the already-ISO value does not,
+        # and a whitespace-only cell becomes empty.
+        rows = [
+            DATE_HEADER,
+            [" 2024.02.29 ", "dot"],            # -> 2024-02-29
+            ["2024/03/05", "ymd slash"],        # -> 2024-03-05
+            ["05/03/2024", "year-last slash"],  # dmy -> 2024-03-05
+            ["2024-03-05", "already iso"],      # not a change
+            ["  ", "blank"],                    # whitespace -> empty
+        ]
+        input_path, original_bytes = self.write_input(
+            rows, bom=False, tag="date_dot_mixed"
+        )
+        output_path = self.tmpdir / "cleaned_date_dot_mixed.csv"
+
+        result = self.run_cleaner(
+            input_path, output_path,
+            rule="normalize-date", column="due_date",
+            include_changes=True,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        summary = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(summary["rows"], 5)
+        # Records 2, 3, 4 and 6 change; record 5 was already ISO.
+        self.assertEqual(summary["changed_cells"], 4)
+        self.assertEqual(
+            [entry["record"] for entry in summary["changes"]],
+            [2, 3, 4, 6],
+        )
+        self.assertEqual(
+            [row[0] for row in self.read_output_records(output_path)[1:]],
+            ["2024-02-29", "2024-03-05", "2024-03-05",
+             "2024-03-05", ""],
         )
         self.assertEqual(input_path.read_bytes(), original_bytes)
 
@@ -2838,6 +3072,146 @@ class DryRunNormalizeDateTests(unittest.TestCase):
                 self.assertIn(value, stderr_text)
                 self.assertFalse(output_path.exists())
 
+    def test_date_preview_accepts_dot_spelling(self):
+        # --dry-run must accept the YYYY.MM.DD spelling, mixed with an
+        # ISO date and an empty cell, and give the same summary as a
+        # real export (records 2 and 3 only) without creating the
+        # output file or any other new file.
+        input_path, original_bytes = self.write_input(
+            DOT_DATE_ROWS, tag="date_preview_dot"
+        )
+        output_path = self.tmpdir / "cleaned_date_preview_dot.csv"
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                summary = json.loads(result.stdout.decode("utf-8"))
+                expected = {
+                    "rows": 4,
+                    "changed_cells": DOT_DATE_EXPECTED_CHANGED,
+                }
+                if include_changes:
+                    expected["changes"] = DOT_DATE_EXPECTED_CHANGES_DETAIL
+                self.assertEqual(summary, expected)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+                self.assert_workspace_holds_only([input_path.name])
+
+    def test_date_preview_dot_summary_matches_real_export(self):
+        # A preview and a real export of the dot sample print the
+        # identical summary; the export converts the due_date column to
+        # 2024-02-29 / 0001-01-01 / 2024-03-01 / "" while preserving
+        # the header, record order and notes, and the preview path
+        # never appears on disk.
+        input_path, original_bytes = self.write_input(
+            DOT_DATE_ROWS, tag="date_preview_dot_vs_export"
+        )
+        preview_path = self.tmpdir / "cleaned_preview_dot.csv"
+        export_path = self.tmpdir / "cleaned_export_dot.csv"
+
+        preview = self.run_cleaner(
+            input_path, preview_path, dry_run=True, include_changes=True
+        )
+        export = self.run_cleaner(
+            input_path, export_path, dry_run=False, include_changes=True
+        )
+
+        self.assertEqual(preview.returncode, 0)
+        self.assertEqual(preview.stderr, b"")
+        self.assertEqual(export.returncode, 0)
+        self.assertEqual(export.stderr, b"")
+        self.assertEqual(preview.stdout, export.stdout)
+        summary = json.loads(export.stdout.decode("utf-8"))
+        self.assertEqual(summary["rows"], 4)
+        self.assertEqual(
+            summary["changed_cells"], DOT_DATE_EXPECTED_CHANGED
+        )
+        self.assertEqual(
+            summary["changes"], DOT_DATE_EXPECTED_CHANGES_DETAIL
+        )
+        self.assertFalse(preview_path.exists())
+        self.assertTrue(export_path.exists())
+        self.assertFalse(
+            export_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+        output_rows = self.read_output_records(export_path)
+        self.assertEqual(output_rows[0], DATE_HEADER)
+        self.assertEqual(
+            [row[0] for row in output_rows[1:]], DOT_DATE_EXPECTED_DATES
+        )
+        self.assertEqual(
+            [row[1] for row in output_rows],
+            [row[1] for row in DOT_DATE_ROWS],
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_date_preview_rejects_dot_non_leap_by_record_number(self):
+        # The 2023.02.29 at record 3 fails the preview with exit 2,
+        # empty stdout, the column, record number and original value on
+        # stderr, no traceback, and no output file or other new file.
+        input_path, original_bytes = self.write_input(
+            DOT_INVALID_ROWS, tag="date_preview_dot_invalid"
+        )
+        output_path = self.tmpdir / "cleaned_date_preview_dot_invalid.csv"
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 3", stderr_text)
+                self.assertIn("2023.02.29", stderr_text)
+                self.assertNotIn("record 4", stderr_text)
+                self.assertNotIn("record 5", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+                self.assert_workspace_holds_only([input_path.name])
+
+    def test_date_preview_rejects_dot_invalid_spellings(self):
+        # Invalid YYYY.MM.DD values fail the preview exactly like the
+        # other spellings: exit 2, empty stdout, the first offending
+        # value quoted at record 2, no output file or other new file.
+        for value in ("2024.2.29", "2024.02.1", "2023.02.29",
+                      "0000.01.01", "２０２４.０２.２９",
+                      "2024.02.29 10:30", "2024 .02.29",
+                      "01.02.2024", "2024-02.29", "2024/02.29",
+                      "2024。02。29"):
+            with self.subTest(value=value):
+                input_path, _ = self.write_input(
+                    [DATE_HEADER, [value, "note"]],
+                    tag="date_preview_dot_bad",
+                )
+                output_path = self.tmpdir / "cleaned_preview_dot_bad.csv"
+
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 2", stderr_text)
+                self.assertIn(value, stderr_text)
+                self.assertFalse(output_path.exists())
+
 
 class DryRunNullMarkerTests(unittest.TestCase):
     """Coverage for --dry-run previews of normalize-null with markers.
@@ -3391,6 +3765,66 @@ class DateOrderCliTests(unittest.TestCase):
         self.assertEqual(
             sorted(summary), ["changed_cells", "changes", "rows"]
         )
+
+    def test_dot_dates_stay_year_month_day_under_either_order(self):
+        # YYYY.MM.DD is independent of --date-order: under mdy, dmy and
+        # with the option omitted it converts identically, including the
+        # leap day and the 0001 endpoint. A dot value with the year last
+        # is not an accepted spelling under either order.
+        rows = [
+            DATE_HEADER,
+            ["2024.02.29", "leap"],
+            ["2024.03.05", "ambiguous-looking"],
+            ["0001.01.01", "low endpoint"],
+        ]
+        for tag, order in (("dot_mdy", "mdy"), ("dot_dmy", "dmy"),
+                           ("dot_omitted", "OMITTED")):
+            with self.subTest(order=order):
+                input_path = self.write_input(rows, tag=tag)
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+
+                result = self.run_cleaner(
+                    input_path, output_path, order=order
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 3, "changed_cells": 3},
+                )
+                self.assertEqual(
+                    [row[0]
+                     for row in self.read_output_records(output_path)[1:]],
+                    ["2024-02-29", "2024-03-05", "0001-01-01"],
+                )
+
+    def test_year_last_dot_value_rejected_under_both_orders(self):
+        # Dots never give a year-last spelling: 03.02.2024 cannot be
+        # read as a slash date under either order and fails at record 2.
+        for order in ("dmy", "mdy"):
+            with self.subTest(order=order):
+                input_path = self.write_input(
+                    [DATE_HEADER, ["03.02.2024", "note"]],
+                    tag=f"dot_year_last_{order}",
+                )
+                output_path = self.tmpdir / (
+                    f"cleaned_dot_year_last_{order}.csv"
+                )
+
+                result = self.run_cleaner(
+                    input_path, output_path, order=order
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn("invalid date", stderr_text)
+                self.assertIn("due_date", stderr_text)
+                self.assertIn("record 2", stderr_text)
+                self.assertIn("03.02.2024", stderr_text)
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
 
     def test_mdy_rejects_impossible_dates_by_record_number(self):
         # Record 2's note contains a quoted real newline, so it spans two
