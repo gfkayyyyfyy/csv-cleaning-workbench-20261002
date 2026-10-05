@@ -1,0 +1,277 @@
+normalize-whitespace 流程说明：字符处理、记录编号与写出时机（csv_cleaner.py）
+=====================================================================
+
+本文依据仓库根目录当前版本的 csv_cleaner.py，说明 --rule
+normalize-whitespace 从读取输入到打印摘要、再到导出文件的完整过程：空白
+按什么标准识别、单元格怎样被改写、CSV 记录如何编号、变化如何计数、结果
+何时写出，以及预览（--dry-run）与真实导出的差别。文中行号对应
+csv_cleaner.py 当前源码，可逐条核对。本次只新增本文这一份说明，程序、
+测试与既有文档均未改动。
+
+一、字符处理：normalize_whitespace() 与 str.isspace
+----------------------------------------------------
+
+* 规则实现是 normalize_whitespace()（第 236-248 行），函数体只有第
+  248 行一句 `" ".join(value.split())`。它在 RULES 字典（第 251-256
+  行）中注册于第 255 行，main() 在第 379-382 行按 --rule 取值绑定，
+  最终在逐记录循环里由第 466 行 `cleaned = rule(original)` 调用。与
+  normalize-null / normalize-date 不同，本规则没有任何额外包装（无
+  partial），rule 就是 normalize_whitespace 本身。
+* 空白按 str.isspace 判定：str.split() 不带参数时，把所有
+  str.isspace 为真的字符当作分隔，连续一段空白算一个分隔点，并自动丢
+  掉首尾分隔产生的空片段。因此两端空白被删除、内部每一段连续空白被改
+  写为一个 ASCII 空格（U+0020）。空字符串仍是空字符串，纯空白字符串
+  变成空字符串。
+* 会被处理的字符包括 ASCII 空格、制表符（\t）、回车（\r）、换行
+  （\n）和全角空格 U+3000（ideographic space）等一切 str.isspace 为
+  真的字符。若目标列的带引号字段里含有真实换行，该换行同样被折叠成
+  一个 ASCII 空格（本文样例中的换行在 note 列，不在目标列，故不受影
+  响）。
+* 零宽空格 U+200B 不是 str.isspace 意义上的空白，str.split() 不会切
+  它，因此被原样保留；除空白之外的所有字符及其顺序都不变。
+* 本规则只做空白规范化：NULL、N/A 之类的空值文字和日期文字不会被识
+  别或转换，仅当它们两端或内部带有空白时才被清理空白本身（例如
+  " NULL " 变成 "NULL"，这是去两端空白的结果，不是空值替换）。
+
+二、记录编号、变化计数与写出时机
+--------------------------------
+
+* 读取只发生在 read_records()（第 337-357 行）。第 346 行以
+  encoding="utf-8-sig"、newline="" 只读打开输入（容忍一个 UTF-8
+  BOM，且不修改输入），第 347 行用
+  `csv.reader(infile, delimiter=delimiter, strict=True)` 按显式分隔
+  符解析（默认逗号，见第 126-127、367 行，从不猜测）。记录序号在第
+  349 行 `enumerate(reader, start=1)` 从 1 开始：表头是记录 1，第一
+  条数据是记录 2；带引号字段内的真实换行不推进记录序号。CSV 语法错
+  误、UTF-8 解码失败与读取失败分别在第 351-356 行经 fail()（第
+  259-261 行：stderr 打印 `error: ...` 后 sys.exit(2)）失败。
+* main()（第 360-501 行）的顺序：参数与规则绑定（第 361-421 行）→
+  输出路径两项检查（第 423-426 行，--dry-run 不豁免）→ 读入全部记
+  录（第 428 行）→ 表头校验（第 430-439 行，第 439 行确定目标列下
+  标）→ 逐条数据循环（第 447-480 行）→ 写出（第 482-494 行，仅非
+  --dry-run）→ 打印摘要（第 496-501 行）。
+* 逐记录循环中：第 448-450 行先做列数校验；第 452 行取目标列原值
+  original；第 466 行调用规则；第 470 行比较清洗前后，不同才在第
+  471-476 行追加一条 {"record", "column", "before", "after"} 到
+  changes、第 477 行写回本列、第 478 行让 changed_cells 加一。before
+  是解析后的原字符串，空白不预先规范化。非目标列自始至终不参与。
+* 写出只发生在第 482 行 `if not args.dry_run:` 之内：第 484 行以
+  "x" 独占新建模式打开输出（encoding="utf-8"、newline=""，无
+  BOM），第 485-486 行由 csv.writer 写出全部行（记录行尾为 CR+LF，
+  字段内的换行保持原样并自动加引号保护）。--dry-run（参数定义在第
+  330-333 行）跳过这一整块，因此预览不创建输出文件，也不创建缺失的
+  父目录。
+* 摘要组装在第 496-501 行：先放 rows（数据记录数，不含表头）与
+  changed_cells，加了 --include-changes（定义在第 319-322 行）才在
+  第 499-500 行附加 changes 数组，第 501 行
+  print(json.dumps(summary)) 打印唯一一个 JSON 对象。json.dumps 默
+  认 ensure_ascii=True，所以摘要里的制表符写作 \t、U+3000 写作
+  \u3000——这是 JSON 转义写法，值本身仍是原字符。两种模式的摘要
+  完全相同。
+
+三、样例输入 whitespace.csv
+---------------------------
+
+在项目根目录把以下内容原样保存为 UTF-8 编码（无 BOM）的
+whitespace.csv（每个物理行末尾为一个 LF，最后一行 `,ok` 之后也有一个
+正常的末尾换行；若当前目录已有同名文件，请先备份或换到空目录）。文件
+含三处不可见字符，位置如下文说明：
+
+    name,note
+     Alice  Smith ,"first line
+    still first"
+    	　,ok
+    A​B,ok
+     NULL ,ok
+    ,ok
+
+不可见字符与物理行、记录的对应关系（记录序号表头记 1）：
+
+  物理行 1  name,note                     记录 1（表头）
+  物理行 2  ` Alice  Smith ,"first line`  记录 2 开始：name 为
+            （行首有一个 ASCII 空格，      ` Alice  Smith `——两端各一个
+             Alice 与 Smith 之间两个空     ASCII 空格，中间两个连续空格；
+             格，逗号前还有一个空格）      note 的引号未闭合
+  物理行 3  still first"                  记录 2 结束：note 解析值为
+                                          "first line\nstill first"，引号
+                                          内是一个真实换行（LF）
+  物理行 4  <TAB><U+3000>,ok              记录 3：name 为一个制表符
+            （行首是制表符，紧接一个       （\t）紧接一个全角空格
+             全角空格，然后是逗号）        （U+3000），两者都不可见
+  物理行 5  A<U+200B>B,ok                 记录 4：name 为 A 与 B 之间夹
+            （A 与 B 之间有一个零宽空格）  一个零宽空格 U+200B
+  物理行 6  ` NULL ,ok`                   记录 5：name 为两端各一个空
+            （NULL 前后各一个空格）        格的 ` NULL `
+  物理行 7  ,ok                           记录 6：name 为空字符串
+
+文件有 7 个物理行，却只有 6 条记录：物理行 2 末尾的换行在引号内，属于
+记录 2 的 note 字段，不结束记录。五条数据记录的 name 依次是
+` Alice  Smith `、一个制表符紧接 U+3000、A 与 B 间含 U+200B、` NULL `
+和空字符串；第一条 note 是由真实换行连接的 first line 与 still first，
+其余四条 note 均为 ok。
+
+四、预览（--dry-run，不写出任何文件）
+--------------------------------------
+
+约定 missing 目录不存在。从项目根目录执行（清理 name 列并开启
+--include-changes，输出路径指向不存在的 missing 目录）：
+
+    python csv_cleaner.py --input whitespace.csv --output missing/preview.csv --column name --rule normalize-whitespace --include-changes --dry-run
+
+结果：退出码 0，标准错误为空，标准输出只有一个 JSON 对象（其中 \t 与
+\u3000 是 JSON 转义写法，分别表示制表符与 U+3000）：
+
+    {"rows": 5, "changed_cells": 3, "changes": [{"record": 2, "column": "name", "before": " Alice  Smith ", "after": "Alice Smith"}, {"record": 3, "column": "name", "before": "\t\u3000", "after": ""}, {"record": 5, "column": "name", "before": " NULL ", "after": "NULL"}]}
+
+核对要点：
+
+* rows 为 5（五条数据记录，不含表头），changed_cells 为 3。
+* changes 按记录顺序只列记录 2、3、5，column 均为 "name"：
+  - 记录 2：before 保留原文 ` Alice  Smith `（两端各一个空格、中间两
+    个连续空格），after 为 "Alice Smith"——两端删除、内部两个空格折
+    成一个 ASCII 空格。
+  - 记录 3：before 是一个制表符紧接一个 U+3000（JSON 中写作
+    "\t\u3000"），两者都是 str.isspace 空白，纯空白字符串变为空字符
+    串，after 为 ""。
+  - 记录 5：before 为 ` NULL `，after 为 "NULL"——仅去掉两端空白，
+    NULL 文字本身不做任何空值替换。
+* 记录 4 的 name 是 A、U+200B、B：U+200B 不是 str.isspace 空白，被
+  原样保留，第 470 行比较为假，不进 changes；记录 6 的 name 本就是空
+  字符串，同样不产生变化。
+* 记录 2 的 note 里那个引号内换行不增加记录序号，后续记录仍依次是
+  3、4、5、6。
+* missing 目录依旧不存在，preview.csv 未创建——预览不创建文件或目
+  录；whitespace.csv 字节不变（输入以只读方式打开，第 346 行）。
+
+五、导出（真实写出）
+--------------------
+
+移除 --dry-run，输出改为当前目录的新文件 exported.csv：
+
+    python csv_cleaner.py --input whitespace.csv --output exported.csv --column name --rule normalize-whitespace --include-changes
+
+结果：退出码 0，标准错误为空，标准输出是与预览完全相同的 JSON 摘要
+（rows 5、changed_cells 3、changes 依次列记录 2、3、5）。exported.csv
+被创建，完整内容如下（记录之间的行尾实际为 CR+LF，这是 csv.writer 的
+默认行终止符；记录 2 备注引号内的换行保持为一个真实 LF；文件为无 BOM
+的 UTF-8，见第 484 行 encoding="utf-8"）：
+
+    name,note
+    Alice Smith,"first line
+    still first"
+    ,ok
+    A​B,ok
+    NULL,ok
+    ,ok
+
+核对要点：
+
+* 表头仍为 name,note，记录顺序不变。记录 2 的 name 变为 Alice Smith
+  （不再需要引号）；其 note 因含真实换行，写出时由 csv.writer 自动加
+  双引号保护，解析值仍是 first line 与 still first 之间一个真实换
+  行。记录 3 的 name 变为空字符串，整行写作 `,ok`。记录 4 未变化，
+  A 与 B 之间的 U+200B 原样保留（上文中不可见）。记录 5 的 name 变为
+  NULL。记录 6 整行仍是 `,ok`。
+* 五条备注的解析内容与输入完全一致，变化只发生在 name 列；输入
+  whitespace.csv 的字节保持原样。
+* 输出无 BOM；若用 utf-8-sig 之外的方式读入看到 ﻿ 才说明有
+  BOM，本程序写出的文件没有。
+
+六、边界：仅含表头的输入
+------------------------
+
+把样例换成只有一行表头 `name,note` 的文件（记为 header_only.csv），同
+样两条命令都成功：
+
+    python csv_cleaner.py --input header_only.csv --output missing/preview.csv --column name --rule normalize-whitespace --include-changes --dry-run
+    python csv_cleaner.py --input header_only.csv --output only_header_out.csv --column name --rule normalize-whitespace --include-changes
+
+结果：两条命令均退出码 0、标准错误为空，标准输出都是：
+
+    {"rows": 0, "changed_cells": 0, "changes": []}
+
+rows 与 changed_cells 均为零，changes 为空数组。导出模式下
+only_header_out.csv 被创建，内容只有表头一行（`name,note` 加 CR+LF）。
+仅含表头不是错误：第 430-431 行只拒绝“连表头记录都没有”的空输入。
+
+七、失败示例：--date-order 与本规则冲突
+---------------------------------------
+
+--date-order 只 govern normalize-date（argparse 定义在第 294-300 行，
+冲突检查在第 417-418 行，发生在读取输入之前）。即使输入仅含表头，搭
+配本规则也会被拒绝：
+
+    python csv_cleaner.py --input header_only.csv --output ho_out.csv --column name --rule normalize-whitespace --date-order mdy
+
+结果：退出码 2，标准输出为空，标准错误为：
+
+    error: --date-order can only be used with --rule normalize-date
+
+不生成任何输出文件或目录，输入保持不变。该检查在路径检查与读文件之
+前，所以无论输入内容如何、输出路径是否可用，结果都一样。
+
+八、失败示例：输出已存在或与输入同路径（两种模式都拒绝）
+----------------------------------------------------------
+
+路径两项检查在第 423-426 行，位于写出分支之前，--dry-run 不豁免：
+
+* 输出与输入同路径：
+
+      python csv_cleaner.py --input whitespace.csv --output whitespace.csv --column name --rule normalize-whitespace --dry-run
+
+  退出码 2，标准输出为空，标准错误：
+
+      error: output path must be different from the input path
+
+* 输出指向已存在的文件（例如第五节已导出的 exported.csv）：
+
+      python csv_cleaner.py --input whitespace.csv --output exported.csv --column name --rule normalize-whitespace
+
+  退出码 2，标准输出为空，标准错误：
+
+      error: output file already exists: 'exported.csv'
+
+两种情况下原文件（输入与已存在的输出）都保持原样，不被覆盖、不被删
+改；去掉或加上 --dry-run 结果相同。
+
+九、缺失父目录：预览可成功，真实导出失败
+------------------------------------------
+
+--dry-run 只做“路径形参”检查（第八节的两项），从不触碰文件系统目
+标：父目录是否存在、目录是否可写，预览一概不验证。因此第四节的预览在
+missing 目录不存在时照常成功。但去掉 --dry-run 做真实导出：
+
+    python csv_cleaner.py --input whitespace.csv --output missing/real.csv --column name --rule normalize-whitespace
+
+结果：退出码 2，标准输出为空，标准错误为（末尾是操作系统的错误文
+本）：
+
+    error: cannot write output file 'missing/real.csv': [Errno 2] No such file or directory: 'missing/real.csv'
+
+第 484 行以 "x" 模式打开失败，经第 489-494 行清理（删除可能已创建的
+半成品文件）后报错；运行后 missing 目录仍不存在，real.csv 未创建，输
+入不变。所以预览成功只说明“输入合法、规则可应用、路径形参不冲突”，
+不能据此推断目标位置可写；预览摘要是变更报告，不是文件能写出的凭证。
+
+十、源码位置核对清单
+----------------------
+
+* 字符处理：normalize_whitespace() 第 236-248 行（核心
+  `" ".join(value.split())` 第 248 行）；RULES 注册第 251-256 行
+  （"normalize-whitespace" 项在第 255 行）；规则绑定第 379-382 行；
+  调用 rule(original) 第 466 行。
+* 记录读取与编号：read_records() 第 337-357 行；只读打开第 346 行；
+  csv.reader(..., strict=True) 第 347 行；enumerate(reader, start=1)
+  第 349 行；CSV/UTF-8/IO 失败第 351-356 行。
+* 变化计数与明细：列数校验第 448-450 行；取目标列原值第 452 行；前
+  后比较第 470 行；changes 追加第 471-476 行；写回本列第 477 行；
+  changed_cells 加一第 478 行。
+* 写出时机：写出块第 482-494 行（`if not args.dry_run:` 第 482 行，
+  "x" 新建、无 BOM 第 484 行，writerows 第 485-486 行，写入失败清理
+  第 489-494 行）；--dry-run 定义第 330-333 行。
+* 摘要：--include-changes 定义第 319-322 行；summary 组装与打印第
+  496-501 行（changes 附加在第 499-500 行）。
+* 参数冲突与路径检查：--date-order 定义第 294-300 行、冲突检查第
+  417-418 行；输出路径两项检查第 423-426 行。
+* 失败出口：fail() 第 259-261 行（stderr 打印 `error: ...` 后
+  sys.exit(2)）。
