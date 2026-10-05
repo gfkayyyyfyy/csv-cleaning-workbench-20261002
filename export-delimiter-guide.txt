@@ -1,0 +1,171 @@
+分号 CSV 清洗后导出为逗号 CSV 说明（csv_cleaner.py）
+===================================================
+
+本文依据仓库根目录当前版本的 csv_cleaner.py，说明“按分号读取、清洗单列、
+再按逗号导出”这条现有流程：读取分隔符由谁决定、导出分隔符如何选择、格式
+转换为什么不计入 changed_cells，以及可原样复现的样例、两条命令、完整输出
+文本和必要的失败边界。文中行号对应 csv_cleaner.py 当前源码。本次只涉及
+读取与导出分隔符，程序本身没有为本文新增任何行为。
+
+一、读取由 --delimiter 决定，导出优先用 --output-delimiter
+----------------------------------------------------------
+
+* 输入分隔符只来自 --delimiter。可接受的名称与实际字符的映射在
+  DELIMITERS（第 119 行，comma→","、semicolon→";"、tab→"\t"）；命令行
+  参数由 parse_args() 中的 argparse choices 限定为这三个小写名称
+  （--delimiter 定义在第 283-291 行，缺省为 comma，第 120 行与
+  第 284 行）。主流程第 342 行 `delimiter = DELIMITERS[args.delimiter]`
+  得到实际字符，随后 read_records()（第 312-332 行）在第 322 行把它原样
+  传给 `csv.reader(..., delimiter=delimiter, strict=True)`，从不根据文件
+  内容猜测分隔符。输入以只读方式打开（第 321 行，encoding="utf-8-sig"、
+  newline=""），因此无论导出成什么格式，输入文件字节都保持不变。
+* 导出分隔符优先使用 --output-delimiter，省略时沿用输入分隔符。该参数
+  定义在第 292-300 行，choices 与 --delimiter 相同，default=None。主
+  流程第 344-352 行做选择：给了 --output-delimiter 就用
+  `DELIMITERS[args.output_delimiter]`，只覆盖导出格式；没给
+  （args.output_delimiter is None）就复用读取用的 delimiter（两者都省略
+  时即逗号）。读取始终用 --delimiter，因此分号进、逗号出等任意组合都
+  允许。
+* 格式转换本身不增加 changed_cells。是否“变更”只在数据循环里按单元格
+  比较清洗结果与原值：第 421 行 `cleaned = rule(record[column_index])`，
+  第 425 行 `if cleaned != record[column_index]:` 为真才追加 changes
+  （第 426-431 行）并令 changed_cells 加一（第 433 行）。output_delimiter
+  直到写出时才出现：第 437-441 行在非 --dry-run 分支里以 "x" 模式新建
+  文件（第 439 行，encoding="utf-8"、newline=""，无 BOM），再用
+  `csv.writer(outfile, delimiter=output_delimiter).writerows(out_rows)`
+  写出。分隔符的切换不参与第 425 行的比较，所以“分号读、逗号写”产生
+  的重引号、重分隔纯属于格式变化，changed_cells 不因它增加。模块文档
+  字符串第 40-53 行也明确记载了这一约定。
+* 摘要 JSON 在第 451-454 行生成并打印：固定含 rows、changed_cells，
+  加 --include-changes（参数定义第 301-304 行）时再按记录顺序附 changes
+  数组（第 452-453 行）。--dry-run（定义第 305-308 行）只跳过第 437 行
+  起的写出整块，读取、清洗、统计与 JSON 与真实导出完全一致。
+
+二、样例输入 sample.csv
+-----------------------
+
+在项目根目录把以下内容原样保存为 UTF-8 编码的 sample.csv（表头一行加
+三条记录，每行末尾为 LF，最后一行后也有一个换行；当前目录若已有同名
+sample.csv，请先备份或换到空目录）：
+
+    name;note
+    " Alice ";"x;y,z"
+    Bob;ok
+    "   ";"say ""hi"""
+
+要点：分号是字段分隔符；第 2 条备注 x;y,z 同时含分号和逗号，整体被双
+引号保护；第 4 条备注 `say "hi"` 中的双引号在 CSV 中写成一对双引号；
+第 2、4 条的 name 分别是首尾带空格的 " Alice " 与三个空格 "   "。
+
+三、预览：--dry-run 到缺失的 missing/preview.csv
+-------------------------------------------------
+
+约定项目根目录下不存在 missing 目录。从项目根目录执行：
+
+    python csv_cleaner.py --input sample.csv --output missing/preview.csv --column name --rule trim --delimiter semicolon --output-delimiter comma --include-changes --dry-run
+
+结果：退出码 0，标准错误为空，标准输出只有一个 JSON 对象：
+
+    {"rows": 3, "changed_cells": 2, "changes": [{"record": 2, "column": "name", "before": " Alice ", "after": "Alice"}, {"record": 4, "column": "name", "before": "   ", "after": ""}]}
+
+要点：
+
+* rows 为 3（不含表头，记录序号从表头记为 1 开始，见 read_records()
+  第 324 行的 enumerate(start=1)），changed_cells 为 2。
+* changes 按记录顺序只包含记录 2 和记录 4，column 均为 "name"；
+  before 保留原字符串，分别是 " Alice " 与三个空格 "   "；after 分别为
+  "Alice" 与空字符串。trim 即 str.strip（RULES，第 233-238 行，trim 项
+  在第 234 行）。记录 3 的 name "Bob" 去除两端空白后不变，不计入；
+  note 列自始至终不被处理。
+* 预览不创建文件或目录：第 437 行的写出整块被跳过，运行后 missing
+  目录仍不存在，preview.csv 未创建，sample.csv 字节不变。缺失父目录
+  本就不阻止 --dry-run（路径检查只在第 392-395 行做“不能与输入同路径、
+  输出不能已存在”两项，不触碰目标文件系统位置）。
+
+四、导出：写出当前目录的新文件 cleaned.csv
+-------------------------------------------
+
+去掉 --dry-run，输出改为当前目录尚不存在的 cleaned.csv：
+
+    python csv_cleaner.py --input sample.csv --output cleaned.csv --column name --rule trim --delimiter semicolon --output-delimiter comma --include-changes
+
+结果：退出码 0，标准错误为空，标准输出与预览完全相同的一个 JSON 对象：
+
+    {"rows": 3, "changed_cells": 2, "changes": [{"record": 2, "column": "name", "before": " Alice ", "after": "Alice"}, {"record": 4, "column": "name", "before": "   ", "after": ""}]}
+
+cleaned.csv 的完整文本如下（每行行尾实际为 CR+LF，这是 csv.writer 的
+默认行终止符；文件为无 BOM 的 UTF-8）：
+
+    name,note
+    Alice,"x;y,z"
+    Bob,ok
+    ,"say ""hi"""
+
+核对要点：
+
+* 分隔符已整体换成逗号：表头 name,note；记录 4 的 name 清空后表现为
+  行首紧跟逗号的空字段。changed_cells 仍为 2，与重分隔、重引号无关。
+* 备注里的分号、逗号、双引号全部保留：第 2 条备注解析值仍是 x;y,z，
+  因为含逗号，写出时由 csv.writer 自动加双引号变成 "x;y,z"（分号在
+  逗号格式下已不是分隔符，但逗号要求引号，里面的分号原样保留）；
+  第 4 条备注解析值仍是 say "hi"，写出时内部双引号 doubling 为
+  "say ""hi"""。这些引号由写出器按逗号格式添加，不是内容变化。
+* cleaned.csv 为无 BOM 的 UTF-8（第 439 行 encoding="utf-8"，不会写
+  BOM）；sample.csv 以只读方式打开，导出后字节不变。
+
+五、输出分隔符的取值边界
+-------------------------
+
+* --output-delimiter 只接受小写的 comma、semicolon、tab（第 292-300 行
+  的 choices=sorted(DELIMITERS)）。省略该参数时输出沿用输入分隔符
+  （第 348-352 行）；--delimiter 同时省略则读写都用逗号。
+* 缺值、空值、大小写错误都在 argparse 阶段被拒，退出码 2、标准输出
+  为空、无输出文件生成（即使输入只有表头也一样）。用仅含表头
+  “name;note”的文件分别演示，三条命令的标准错误均先打印一段 usage
+  提示，最后一行为：
+
+  * 缺值（--output-delimiter 后无值，例如位于命令末尾）：
+
+        csv_cleaner.py: error: argument --output-delimiter: expected one argument
+
+  * 空值（--output-delimiter ""）：
+
+        csv_cleaner.py: error: argument --output-delimiter: invalid choice: '' (choose from comma, semicolon, tab)
+
+  * 大写 Comma：
+
+        csv_cleaner.py: error: argument --output-delimiter: invalid choice: 'Comma' (choose from comma, semicolon, tab)
+
+  这些报错由 argparse 在 parse_args()（第 246 行起）内直接产生，程序
+  在任何路径检查与写出之前即退出，因此不会创建输出文件。
+
+六、路径边界：预览与导出同口径拒绝什么、差别在哪
+--------------------------------------------------
+
+第 392-395 行的两项路径形参检查位于读取与写出之前，--dry-run 并不
+豁免，因此预览和导出以完全相同的口径拒绝：
+
+* 输出与输入同路径（abspath 相同，第 392-393 行），退出码 2、标准
+  输出为空，标准错误：
+
+      error: output path must be different from the input path
+
+* 输出文件已存在（os.path.exists 为真，第 394-395 行），退出码 2、
+  标准输出为空，标准错误（以 cleaned.csv 已存在为例）：
+
+      error: output file already exists: 'cleaned.csv'
+
+  真实导出另有第 442-443 行的 FileExistsError 兜底（第 439 行用 "x"
+  独占新建模式），报错口径与上面一致。两种情况下输入文件和已存在的
+  输出原内容都保持不变。
+
+* 缺失父目录是预览与导出唯一的差别：父目录不存在不阻止 --dry-run
+  （第三节即为示例，预览退出 0 且不创建 missing 目录）；真实导出时
+  第 439 行打开失败抛出 OSError，由第 444-449 行捕获，先尝试
+  os.unlink 清理可能已生成的半成品（第 445-448 行），再经 fail()
+  （第 241-243 行）退出码 2、标准输出为空，标准错误形如：
+
+      error: cannot write output file 'missing/preview.csv': [Errno 2] No such file or directory: 'missing/preview.csv'
+
+  失败后既不产生输出文件，也不会顺带创建缺失的父目录，输入保持
+  原样。
