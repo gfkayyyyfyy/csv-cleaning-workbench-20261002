@@ -325,6 +325,30 @@ The tests exercise only the documented public CLI:
   stderr reason naming --output-delimiter and the missing or illegal
   value, no Python traceback, no output file and untouched input bytes,
   both on the data sample and on a header-only file.
+* normalize-null text fidelity across a semicolon-to-comma delimiter
+  conversion: a UTF-8 semicolon name;note sample whose three parsed data
+  rows are (" NULL ", a;b), (待补, "line one\nline two") and
+  (" Bob ", ok) is run with --delimiter semicolon, --output-delimiter
+  comma, --null-marker 待补, --null-replacement set to
+  ' 未知,待补;"待定"\n下一行 ' (one space at each end, a comma, a
+  semicolon, double quotes and a real newline inside) and
+  --include-changes, both with and without a UTF-8 BOM. The --dry-run
+  preview (into a path below a nonexistent parent directory) and the
+  real export into an existing directory both exit 0 with empty stderr
+  and print the same single parsed JSON object: rows 3 /
+  changed_cells 2, with only records 2 and 3 listed in record order on
+  column name, before being " NULL " and 待补 and after being the full
+  replacement text. The BOM-free UTF-8 comma export reads back with
+  exactly two fields per record: the header, record order and every
+  note stay unchanged (including the quoted real newline) and the
+  third name " Bob " keeps both surrounding spaces; the preview
+  creates neither the file nor the missing parent and the input bytes
+  stay untouched. A variant whose third data record has only one
+  field fails in both preview and export with exit 2, empty stdout and
+  stderr exactly "error: record 4 has 1 field(s), expected 2\n" (the
+  real newline quoted inside the preceding note does not advance the
+  record number), no Python traceback, no output file and untouched
+  input bytes.
 """
 
 import codecs
@@ -5648,6 +5672,242 @@ class OutputDelimiterCliTests(unittest.TestCase):
                     self.assertEqual(
                         input_path.read_bytes(), original_bytes
                     )
+
+
+class NullReplacementDelimiterConversionTests(unittest.TestCase):
+    """normalize-null text fidelity on a semicolon-to-comma conversion.
+
+    These tests pin only this one combination of features:
+    normalize-null with a custom marker and a replacement text packed
+    with every quoting hazard, read with --delimiter semicolon and
+    exported with --output-delimiter comma. Every test goes through the
+    documented public CLI against small UTF-8 CSV files in a private
+    temporary directory (created and removed with the standard
+    tempfile machinery): no external files or network. Results are
+    judged on parsed CSV fields and the parsed JSON object, so
+    equivalent quoting styles, record separators and JSON key order are
+    irrelevant.
+    """
+
+    # The three parsed data rows:
+    #   (" NULL ", "a;b")
+    #   ("待补",   "line one\nline two")
+    #   (" Bob ",  "ok")
+    # The second note embeds a real newline, which is quoted in the
+    # file and must not advance the CSV record number.
+    SAMPLE_ROWS = [
+        ["name", "note"],
+        [" NULL ", "a;b"],
+        ["待补", "line one\nline two"],
+        [" Bob ", "ok"],
+    ]
+    # Failure sample: the third data record is a single field, which
+    # must be reported as record 4 (the header is record 1, and the
+    # quoted newline inside the previous note does not add a record).
+    SHORT_RECORD_ROWS = [
+        ["name", "note"],
+        [" NULL ", "a;b"],
+        ["待补", "line one\nline two"],
+        ["onlyone"],
+    ]
+
+    MARKER = "待补"
+    # One space at each end; inside sit a comma, a semicolon, double
+    # quotes and one real newline. Every character must survive into
+    # both the JSON summary and the comma export.
+    REPLACEMENT = ' 未知,待补;"待定"\n下一行 '
+
+    EXPECTED_ROWS = [
+        ["name", "note"],
+        [REPLACEMENT, "a;b"],
+        [REPLACEMENT, "line one\nline two"],
+        [" Bob ", "ok"],
+    ]
+    EXPECTED_SUMMARY = {
+        "rows": 3,
+        "changed_cells": 2,
+        "changes": [
+            {"record": 2, "column": "name",
+             "before": " NULL ", "after": REPLACEMENT},
+            {"record": 3, "column": "name",
+             "before": MARKER, "after": REPLACEMENT},
+        ],
+    }
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag):
+        """Serialize rows with semicolon separators, as UTF-8 bytes."""
+        buffer = io.StringIO()
+        csv.writer(buffer, delimiter=";").writerows(rows)
+        encoding = "utf-8-sig" if bom else "utf-8"
+        data = buffer.getvalue().encode(encoding)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *,
+                    dry_run=False):
+        argv = [
+            sys.executable, str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "name",
+            "--rule", "normalize-null",
+            "--delimiter", "semicolon",
+            "--output-delimiter", "comma",
+            "--null-marker", self.MARKER,
+            "--null-replacement", self.REPLACEMENT,
+            "--include-changes",
+        ]
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as
+        # content; the export is parsed with the comma dialect.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile, delimiter=","))
+
+    def workspace_names(self):
+        return sorted(p.name for p in self.tmpdir.iterdir())
+
+    def test_preview_and_export_match_with_and_without_bom(self):
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "nullconv_bom" if bom else "nullconv_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.SAMPLE_ROWS, bom=bom, tag=tag
+                )
+
+                # Preview into a path below a parent directory that
+                # does not exist.
+                missing_dir = self.tmpdir / f"nodir_{tag}"
+                preview_path = missing_dir / "preview.csv"
+                self.assertFalse(missing_dir.exists())
+                self.assertFalse(preview_path.exists())
+                before_names = self.workspace_names()
+
+                preview = self.run_cleaner(
+                    input_path, preview_path, dry_run=True
+                )
+
+                self.assertEqual(preview.returncode, 0)
+                self.assertEqual(preview.stderr, b"")
+                # The whole stdout is one JSON object and nothing else.
+                preview_summary = json.loads(
+                    preview.stdout.decode("utf-8")
+                )
+                self.assertEqual(preview_summary, self.EXPECTED_SUMMARY)
+                # The preview creates neither the file nor its missing
+                # parent, nor anything else in the workspace.
+                self.assertFalse(preview_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(self.workspace_names(), before_names)
+
+                # Real export into the existing temporary directory as
+                # a fresh filename.
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(input_path, output_path)
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                export_summary = json.loads(
+                    result.stdout.decode("utf-8")
+                )
+                # Parsed JSON content is identical between preview and
+                # export (no reliance on key order or spacing).
+                self.assertEqual(export_summary, preview_summary)
+                self.assertEqual(export_summary, self.EXPECTED_SUMMARY)
+
+                # The export is BOM-free UTF-8 even when the input had
+                # a BOM.
+                raw_output = output_path.read_bytes()
+                raw_output.decode("utf-8")
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+
+                # Parsed with commas the export still has exactly two
+                # fields per record: the replacement's own commas,
+                # semicolon, quotes and real newline must all be
+                # carried inside the quoted name field.
+                output_rows = self.read_output_records(output_path)
+                self.assertTrue(
+                    all(len(row) == 2 for row in output_rows),
+                    output_rows,
+                )
+                self.assertEqual(output_rows, self.EXPECTED_ROWS)
+                # Header and record order unchanged...
+                self.assertEqual(
+                    [row[0] for row in output_rows],
+                    [row[0] for row in self.EXPECTED_ROWS],
+                )
+                # ...and the note column is byte-for-byte the parsed
+                # input notes, including the quoted real newline.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in self.SAMPLE_ROWS],
+                )
+                # The untouched third name keeps both surrounding
+                # spaces.
+                self.assertEqual(output_rows[3][0], " Bob ")
+                self.assertTrue(
+                    output_rows[3][0].startswith(" ")
+                    and output_rows[3][0].endswith(" ")
+                )
+
+                # The input file is opened read-only: exact bytes
+                # remain, BOM and all.
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_short_record_fails_in_preview_and_export(self):
+        # The short-record variant is exercised without a BOM; its
+        # quoted-note newline must not inflate the record number.
+        input_path, original_bytes = self.write_input(
+            self.SHORT_RECORD_ROWS, bom=False, tag="nullconv_short"
+        )
+        missing_dir = self.tmpdir / "nodir_nullconv_short"
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                if dry_run:
+                    output_path = missing_dir / "preview.csv"
+                    self.assertFalse(missing_dir.exists())
+                else:
+                    output_path = (
+                        self.tmpdir / "cleaned_nullconv_short.csv"
+                    )
+                self.assertFalse(output_path.exists())
+                before_names = self.workspace_names()
+
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=dry_run
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(
+                    result.stderr.decode("utf-8"),
+                    "error: record 4 has 1 field(s), expected 2\n",
+                )
+                self.assertNotIn(
+                    "Traceback", result.stderr.decode("utf-8")
+                )
+                self.assertFalse(output_path.exists())
+                # No output file, no missing parent, no stray file.
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(self.workspace_names(), before_names)
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
 
 
 if __name__ == "__main__":
