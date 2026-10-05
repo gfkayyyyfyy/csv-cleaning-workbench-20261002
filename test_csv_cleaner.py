@@ -377,6 +377,29 @@ The tests exercise only the documented public CLI:
   exits 2 with empty stdout and the reason that the switch can only be
   used with --rule normalize-null, no Python traceback, no output file
   and untouched input bytes.
+* Regression: without --null-replacement an already-empty cell is still
+  a normalize-null hit even though the default empty replacement leaves
+  it unchanged. The comma state,note acceptance sample has six data
+  records whose states parse as "", three ASCII spaces, one U+3000
+  ideographic space, " nUlL ", " N/a " and " NULLABLE "; the first note
+  carries a quoted real newline and the other five notes are plain. No
+  custom null markers and no replacement text are given; both detail
+  switches are on. The --dry-run preview (output below a nonexistent
+  parent directory) and a real export both exit 0 with empty stderr and
+  print the same single parsed JSON object: rows 6 / changed_cells 4,
+  null_matches listing records 2 through 6 in record order on column
+  state with the parsed originals (surrounding whitespace preserved),
+  while changes lists only records 3 through 6, each with after the
+  empty string -- record 2 was already empty, so it is a hit without a
+  change (record numbers count the header as 1 and do not advance for
+  the quoted newline). The BOM-free export keeps the header, record
+  order and every note, leaves the first five states empty and keeps
+  " NULLABLE " verbatim; the preview creates neither the output file
+  nor its missing parent and the input bytes stay untouched both
+  times. Appending a one-field record makes the sample fail in both
+  modes with exit 2, empty stdout and stderr containing
+  "record 8 has 1 field(s), expected 2", no Python traceback, no
+  output file or partial hit summary and untouched input bytes.
 """
 
 import codecs
@@ -6224,6 +6247,235 @@ class IncludeNullMatchesCliTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr_text)
         self.assertFalse(output_path.exists())
         self.assertEqual(input_path.read_bytes(), original_bytes)
+
+
+class IncludeNullMatchesDefaultEmptyRegressionTests(unittest.TestCase):
+    """Regression: an already-empty cell is a null hit with no replacement.
+
+    When --null-replacement is not provided the default replacement is
+    the empty string, so a cell that parses as empty is matched by
+    normalize-null without changing at all. It must still appear in
+    null_matches and must not appear in changes; whitespace-only cells
+    and padded NULL / N/A spellings are hits and changes together, and
+    NULLABLE stays verbatim. Every test drives the documented public
+    CLI against comma UTF-8 CSV files in private temporary
+    directories, judged on parsed CSV fields and the parsed JSON
+    object so CSV quoting style and JSON key order are irrelevant,
+    using only the standard library.
+    """
+
+    # state,note header plus six data records. The states parse as the
+    # empty string, three ASCII spaces, one U+3000 ideographic space,
+    # padded nUlL, padded N/a and padded NULLABLE. Only the first note
+    # carries a quoted real newline, so the six data rows are records
+    # 2-7 (the header is record 1 and the quoted newline does not
+    # advance the number).
+    SAMPLE_ROWS = [
+        ["state", "note"],
+        ["", 'line one\nline two'],  # record 2: empty, hit without change
+        ["   ", "plain two"],        # record 3: ASCII spaces -> empty
+        ["　", "plain three"],       # record 4: U+3000 only -> empty
+        [" nUlL ", "plain four"],    # record 5: padded NULL -> empty
+        [" N/a ", "plain five"],     # record 6: padded N/A -> empty
+        [" NULLABLE ", "plain six"],  # record 7: near miss, verbatim
+    ]
+
+    # Records 2-6 all match; record 2 keeps the parsed empty original.
+    EXPECTED_NULL_MATCHES = [
+        {"record": 2, "column": "state", "before": ""},
+        {"record": 3, "column": "state", "before": "   "},
+        {"record": 4, "column": "state", "before": "　"},
+        {"record": 5, "column": "state", "before": " nUlL "},
+        {"record": 6, "column": "state", "before": " N/a "},
+    ]
+    # Record 2 was already empty, so only records 3-6 change, all to "".
+    EXPECTED_CHANGES = [
+        {"record": 3, "column": "state", "before": "   ", "after": ""},
+        {"record": 4, "column": "state", "before": "　", "after": ""},
+        {"record": 5, "column": "state",
+         "before": " nUlL ", "after": ""},
+        {"record": 6, "column": "state",
+         "before": " N/a ", "after": ""},
+    ]
+    EXPECTED_STATES = ["", "", "", "", "", " NULLABLE "]
+    EXPECTED_NOTES = [row[1] for row in SAMPLE_ROWS]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, tag):
+        data = encode_csv(rows, bom=False)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, dry_run=False):
+        # No --null-marker and no --null-replacement: default markers
+        # with the default empty replacement; both detail switches on.
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "state",
+            "--rule", "normalize-null",
+            "--include-null-matches",
+            "--include-changes",
+        ]
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def expected_summary(self):
+        return {
+            "rows": 6,
+            "changed_cells": 4,
+            "null_matches": self.EXPECTED_NULL_MATCHES,
+            "changes": self.EXPECTED_CHANGES,
+        }
+
+    def test_preview_and_export_count_empty_cell_as_null_hit(self):
+        # Acceptance run: the --dry-run preview points below a parent
+        # directory that does not exist and the real export at a fresh
+        # file in the existing temporary directory. Both must exit 0
+        # with empty stderr and print the same single parsed JSON
+        # object; the empty state is in null_matches but not in
+        # changes, and neither run may alter the input bytes.
+        input_path, original_bytes = self.write_input(
+            self.SAMPLE_ROWS, tag="empty_hit"
+        )
+        missing_dir = self.tmpdir / "nodir_empty_hit"
+        preview_path = missing_dir / "preview.csv"
+        export_path = self.tmpdir / "exported_empty_hit.csv"
+        self.assertFalse(missing_dir.exists())
+        self.assertFalse(preview_path.exists())
+        self.assertFalse(export_path.exists())
+
+        preview = self.run_cleaner(input_path, preview_path, dry_run=True)
+
+        self.assertEqual(preview.returncode, 0)
+        self.assertEqual(preview.stderr, b"")
+        # The whole stdout is one JSON object and nothing else.
+        preview_text = preview.stdout.decode("utf-8")
+        decoded, end = json.JSONDecoder().raw_decode(preview_text)
+        self.assertEqual(preview_text[end:].strip(), "")
+        preview_summary = decoded
+        self.assertEqual(preview_summary, self.expected_summary())
+        # The already-empty record is the first hit...
+        self.assertEqual(preview_summary["null_matches"][0]["record"], 2)
+        self.assertEqual(preview_summary["null_matches"][0]["before"], "")
+        # ...but changes start at record 3 and every after is empty.
+        self.assertEqual(
+            [entry["record"] for entry in preview_summary["changes"]],
+            [3, 4, 5, 6],
+        )
+        self.assertTrue(
+            all(entry["after"] == ""
+                for entry in preview_summary["changes"])
+        )
+        self.assertTrue(
+            all(entry["column"] == "state"
+                for entry in preview_summary["null_matches"])
+        )
+        # null_matches entries carry only record/column/before; changes
+        # entries additionally carry after.
+        self.assertEqual(
+            [set(entry) for entry in preview_summary["null_matches"]],
+            [{"record", "column", "before"}] * 5,
+        )
+        self.assertEqual(
+            [set(entry) for entry in preview_summary["changes"]],
+            [{"record", "column", "before", "after"}] * 4,
+        )
+        # The preview creates neither the file nor its missing parent.
+        self.assertFalse(preview_path.exists())
+        self.assertFalse(missing_dir.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        result = self.run_cleaner(input_path, export_path)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        # Same single JSON object (parsed comparison, key order and
+        # equivalent quoting are irrelevant).
+        result_text = result.stdout.decode("utf-8")
+        result_summary, end = json.JSONDecoder().raw_decode(result_text)
+        self.assertEqual(result_text[end:].strip(), "")
+        self.assertEqual(result_summary, preview_summary)
+
+        raw_output = export_path.read_bytes()
+        # The export is BOM-free UTF-8 (a stray BOM would fail this
+        # decode-as-plain-utf-8 or the prefix check).
+        raw_output.decode("utf-8")
+        self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+        output_rows = self.read_output_records(export_path)
+        # Header and record order are preserved...
+        self.assertEqual(output_rows[0], ["state", "note"])
+        self.assertEqual(len(output_rows), 7)
+        # ...the first five states are empty and NULLABLE keeps both
+        # surrounding spaces...
+        self.assertEqual(
+            [row[0] for row in output_rows[1:]], self.EXPECTED_STATES
+        )
+        self.assertEqual(output_rows[6][0], " NULLABLE ")
+        # ...and every note round-trips, including the quoted real
+        # newline in the first one.
+        self.assertEqual(
+            [row[1] for row in output_rows], self.EXPECTED_NOTES
+        )
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_short_record_fails_in_preview_and_export(self):
+        # Appending a one-field record must fail after the six valid
+        # data rows: it is record 8 (header plus six rows; the quoted
+        # newline does not advance the number). Neither mode may print
+        # a hit summary or leave an output file behind.
+        short_rows = self.SAMPLE_ROWS + [["tail-only"]]
+        input_path, original_bytes = self.write_input(
+            short_rows, tag="empty_hit_short"
+        )
+        missing_dir = self.tmpdir / "nodir_empty_hit_short"
+        before_names = sorted(
+            str(rel) for rel in self.tmpdir.rglob("*")
+        )
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                if dry_run:
+                    output_path = missing_dir / "preview.csv"
+                    self.assertFalse(missing_dir.exists())
+                else:
+                    output_path = self.tmpdir / "exported_short.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=dry_run
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                stderr_text = result.stderr.decode("utf-8")
+                self.assertIn(
+                    "record 8 has 1 field(s), expected 2", stderr_text
+                )
+                self.assertNotIn("Traceback", stderr_text)
+                self.assertFalse(output_path.exists())
+                # No output file, no missing parent, no partial detail.
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(input_path.read_bytes(), original_bytes)
+        # Nothing at all was added to the workspace in either mode.
+        self.assertEqual(
+            sorted(str(rel) for rel in self.tmpdir.rglob("*")),
+            before_names,
+        )
 
 
 if __name__ == "__main__":
