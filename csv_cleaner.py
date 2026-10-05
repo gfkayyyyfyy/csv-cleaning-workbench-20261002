@@ -153,6 +153,33 @@ def normalize_null(value, extra_markers=frozenset(), replacement=""):
     return value
 
 
+# Accepted spellings that are always read year-month-day; the separator
+# is part of the spelling and the three are never mixed within a value.
+DATE_YMD_PATTERNS = (DATE_ISO_RE, DATE_YMD_SLASH_RE, DATE_DOT_RE)
+
+
+def parse_date_fields(stripped, date_order):
+    """Split an accepted date spelling into (year, month, day) ints.
+
+    The three YYYY-first spellings always read year-month-day regardless
+    of date_order. The year-last slash spelling NN/NN/YYYY follows the
+    explicit order only: "dmy" reads it DD/MM/YYYY and "mdy" reads it
+    MM/DD/YYYY, with no guessing or fallback. Returns None when stripped
+    matches none of the accepted spellings.
+    """
+    for pattern in DATE_YMD_PATTERNS:
+        match = pattern.match(stripped)
+        if match:
+            return tuple(int(part) for part in match.groups())
+    match = DATE_SLASH_YEAR_RE.match(stripped)
+    if match:
+        first, second, year = (int(part) for part in match.groups())
+        if date_order == "mdy":
+            return year, first, second
+        return year, second, first
+    return None
+
+
 def normalize_date(value, date_order=DEFAULT_DATE_ORDER):
     """Normalize an accepted date spelling to YYYY-MM-DD.
 
@@ -177,27 +204,10 @@ def normalize_date(value, date_order=DEFAULT_DATE_ORDER):
     stripped = value.strip()
     if not stripped:
         return ""
-    match = DATE_ISO_RE.match(stripped)
-    if match:
-        year, month, day = (int(part) for part in match.groups())
-    else:
-        match = DATE_YMD_SLASH_RE.match(stripped)
-        if match:
-            year, month, day = (int(part) for part in match.groups())
-        else:
-            match = DATE_DOT_RE.match(stripped)
-            if match:
-                year, month, day = (int(part) for part in match.groups())
-            else:
-                match = DATE_SLASH_YEAR_RE.match(stripped)
-                if match:
-                    first, second, year = (int(part) for part in match.groups())
-                    if date_order == "mdy":
-                        month, day = first, second
-                    else:
-                        day, month = first, second
-                else:
-                    raise InvalidDateError(f"invalid date: {value!r}")
+    fields = parse_date_fields(stripped, date_order)
+    if fields is None:
+        raise InvalidDateError(f"invalid date: {value!r}")
+    year, month, day = fields
     try:
         normalized = date(year, month, day)
     except ValueError:
