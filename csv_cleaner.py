@@ -153,6 +153,29 @@ def normalize_null(value, extra_markers=frozenset(), replacement=""):
     return value
 
 
+def _parse_year_month_day(match, date_order):
+    """Groups are already (year, month, day); date_order never applies."""
+    return tuple(int(part) for part in match.groups())
+
+
+def _parse_year_last_slash(match, date_order):
+    """NN/NN/YYYY: the two leading fields follow the explicit date_order."""
+    first, second, year = (int(part) for part in match.groups())
+    if date_order == "mdy":
+        return year, first, second
+    return year, second, first
+
+
+# Accepted date spellings as (pattern, parser) pairs, tried in order.
+# Each parser turns the match into a (year, month, day) int tuple.
+DATE_PARSERS = (
+    (DATE_ISO_RE, _parse_year_month_day),
+    (DATE_YMD_SLASH_RE, _parse_year_month_day),
+    (DATE_DOT_RE, _parse_year_month_day),
+    (DATE_SLASH_YEAR_RE, _parse_year_last_slash),
+)
+
+
 def normalize_date(value, date_order=DEFAULT_DATE_ORDER):
     """Normalize an accepted date spelling to YYYY-MM-DD.
 
@@ -177,29 +200,16 @@ def normalize_date(value, date_order=DEFAULT_DATE_ORDER):
     stripped = value.strip()
     if not stripped:
         return ""
-    match = DATE_ISO_RE.match(stripped)
-    if match:
-        year, month, day = (int(part) for part in match.groups())
-    else:
-        match = DATE_YMD_SLASH_RE.match(stripped)
+    parts = None
+    for pattern, parse in DATE_PARSERS:
+        match = pattern.match(stripped)
         if match:
-            year, month, day = (int(part) for part in match.groups())
-        else:
-            match = DATE_DOT_RE.match(stripped)
-            if match:
-                year, month, day = (int(part) for part in match.groups())
-            else:
-                match = DATE_SLASH_YEAR_RE.match(stripped)
-                if match:
-                    first, second, year = (int(part) for part in match.groups())
-                    if date_order == "mdy":
-                        month, day = first, second
-                    else:
-                        day, month = first, second
-                else:
-                    raise InvalidDateError(f"invalid date: {value!r}")
+            parts = parse(match, date_order)
+            break
+    if parts is None:
+        raise InvalidDateError(f"invalid date: {value!r}")
     try:
-        normalized = date(year, month, day)
+        normalized = date(*parts)
     except ValueError:
         raise InvalidDateError(f"invalid date: {value!r}") from None
     return normalized.isoformat()

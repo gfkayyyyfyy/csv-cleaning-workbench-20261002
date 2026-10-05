@@ -432,10 +432,10 @@ MIXED_DATE_EXPECTED_CHANGES_DETAIL = [
      "before": "   ", "after": ""},
 ]
 
-# Dot-spelling sample mirroring the acceptance dates.csv: the new
-# YYYY.MM.DD spelling is mixed with an already-ISO date and an empty
-# cell. The first value is padded at both ends; only records 2 and 3
-# change (record 4 is already ISO and record 5 already empty).
+# Dot-spelling sample: the new YYYY.MM.DD spelling is mixed with an
+# already-ISO date and an empty cell. The first value is padded at both
+# ends; only records 2 and 3 change (record 4 is already ISO and
+# record 5 already empty).
 DOT_DATE_ROWS = [
     DATE_HEADER,
     [" 2024.02.29 ", "a"],          # YYYY.MM.DD, padded ends -> 2024-02-29
