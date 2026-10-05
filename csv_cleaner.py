@@ -61,8 +61,8 @@ date with the year last is read:
     --date-order accepts only lowercase dmy and mdy; omitting it is the
     same as dmy (DD/MM/YYYY). Under mdy the year-last slash date is read
     as MM/DD/YYYY, with ambiguous fields settled by the chosen order and
-    no guessing or fallback. YYYY-MM-DD, YYYY/MM/DD and YYYY.MM.DD stay
-    year-month-day under either order.
+    no guessing or fallback. YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD and the
+    compact eight-digit YYYYMMDD stay year-month-day under either order.
 
 normalize-whitespace strips both ends and collapses every internal run
 of whitespace (judged by str.isspace) to one ASCII space:
@@ -114,6 +114,9 @@ DATE_YMD_SLASH_RE = re.compile(r"^([0-9]{4})/([0-9]{2})/([0-9]{2})$")
 # A dot date is always year-month-day; the two English periods are part
 # of the spelling and --date-order never applies to it.
 DATE_DOT_RE = re.compile(r"^([0-9]{4})\.([0-9]{2})\.([0-9]{2})$")
+# A compact date is exactly eight ASCII digits with no separator, always
+# read year-month-day; --date-order never applies to it.
+DATE_COMPACT_RE = re.compile(r"^([0-9]{4})([0-9]{2})([0-9]{2})$")
 
 # Accepted --date-order values: how to read a NN/NN/YYYY slash date.
 DATE_ORDERS = ("dmy", "mdy")
@@ -172,14 +175,16 @@ def normalize_null(value, extra_markers=frozenset(), replacement=""):
 
 
 # Accepted spellings that are always read year-month-day; the separator
-# is part of the spelling and the three are never mixed within a value.
-DATE_YMD_PATTERNS = (DATE_ISO_RE, DATE_YMD_SLASH_RE, DATE_DOT_RE)
+# (or lack of one) is part of the spelling and they are never mixed
+# within a value.
+DATE_YMD_PATTERNS = (DATE_ISO_RE, DATE_YMD_SLASH_RE, DATE_DOT_RE,
+                     DATE_COMPACT_RE)
 
 
 def parse_date_fields(stripped, date_order):
     """Split an accepted date spelling into (year, month, day) ints.
 
-    The three YYYY-first spellings always read year-month-day regardless
+    The four YYYY-first spellings always read year-month-day regardless
     of date_order. The year-last slash spelling NN/NN/YYYY follows the
     explicit order only: "dmy" reads it DD/MM/YYYY and "mdy" reads it
     MM/DD/YYYY, with no guessing or fallback. Returns None when stripped
@@ -202,22 +207,25 @@ def normalize_date(value, date_order=DEFAULT_DATE_ORDER):
     """Normalize an accepted date spelling to YYYY-MM-DD.
 
     After stripping both ends, an empty cell stays empty. Anything else
-    must be exactly YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD or a slash date
-    with the four-digit year last (NN/NN/YYYY), using ASCII digits, a
-    four-digit year and two-digit month/day, and must be a real
-    proleptic Gregorian calendar date in years 0001-9999; the result is
-    always spelled YYYY-MM-DD.
+    must be exactly YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, the compact
+    eight-digit YYYYMMDD or a slash date with the four-digit year last
+    (NN/NN/YYYY), using ASCII digits, a four-digit year and two-digit
+    month/day, and must be a real proleptic Gregorian calendar date in
+    years 0001-9999; the result is always spelled YYYY-MM-DD.
 
     YYYY.MM.DD is always read year-month-day with two English periods;
-    like YYYY-MM-DD and YYYY/MM/DD it is unaffected by date_order. The
-    year-last slash date is read by the explicit date_order only:
+    like YYYY-MM-DD, YYYY/MM/DD and the compact YYYYMMDD it is
+    unaffected by date_order. The compact spelling is exactly eight
+    ASCII digits with no separator, always four-digit year, two-digit
+    month and two-digit day in that order, never guessed or swapped.
+    The year-last slash date is read by the explicit date_order only:
     "dmy" reads it as DD/MM/YYYY and "mdy" as MM/DD/YYYY. Ambiguous
     values follow that order with no guessing or fallback (under mdy
     13/02/2024 means month 13 and is invalid). YYYY-MM-DD,
-    YYYY/MM/DD and YYYY.MM.DD are always year-month-day under either
-    order. Internal whitespace, unpadded numbers, mixed separators,
-    time suffixes and null markers such as NULL or N/A are invalid and
-    raise InvalidDateError.
+    YYYY/MM/DD, YYYY.MM.DD and YYYYMMDD are always year-month-day under
+    either order. Internal whitespace, unpadded numbers, mixed
+    separators, time suffixes and null markers such as NULL or N/A are
+    invalid and raise InvalidDateError.
     """
     stripped = value.strip()
     if not stripped:
@@ -296,8 +304,9 @@ def parse_args(argv):
                         help="how to read a slash date with the year last "
                              "for normalize-date: dmy (DD/MM/YYYY, the "
                              "default when omitted) or mdy (MM/DD/YYYY); "
-                             "YYYY-MM-DD, YYYY/MM/DD and YYYY.MM.DD stay "
-                             "year-month-day under either order")
+                             "YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD and the "
+                             "compact YYYYMMDD stay year-month-day under "
+                             "either order")
     parser.add_argument("--delimiter", choices=sorted(DELIMITERS),
                         default=DEFAULT_DELIMITER_NAME,
                         metavar="NAME",
