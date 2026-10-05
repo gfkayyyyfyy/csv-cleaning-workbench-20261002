@@ -1,0 +1,246 @@
+normalize-null 空值命中明细与变化明细说明（csv_cleaner.py）
+==========================================================
+
+本文依据仓库根目录当前版本的 csv_cleaner.py，说明 normalize-null 规则下
+“空值命中明细”（--include-null-matches 的 null_matches）与“实际变化明细”
+（--include-changes 的 changes）各自记录什么、为什么两者不总是同样多，
+并给出一份可原样复现的 UTF-8 样例、预览与导出两条完整命令、完整预期 JSON
+与导出 CSV，以及三类错误的边界。文中行号对应 csv_cleaner.py 当前源码。
+本次只补充说明文档，产品代码、测试与既有文档均未改动。
+
+一、匹配语义与相关函数位置
+--------------------------
+
+* 默认标记是 NULL_MARKERS（第 106 行）：frozenset({"null", "n/a"})。
+  自定义标记不是替换、而是追加：is_null_match() 第 153 行的判定是
+  `lowered in NULL_MARKERS or lowered in extra_markers`，所以无论
+  --null-marker 传什么，默认的 null / n/a 始终命中。--null-marker 可重复，
+  参数定义在第 279-284 行；主流程第 389-395 行收集它们：每个标记先
+  str.strip()（第 391 行），空串或纯空白标记被拒绝（第 392-394 行），
+  再经 ascii_lower() 折成小写后放入集合 extra_markers（第 395 行），
+  重复标记折叠为一个，不会重复计数。
+* 整值匹配，先去两端空白。判定集中在 is_null_match()（第 141-153 行）：
+  第 149 行 `stripped = value.strip()` 先对单元格原值去两端空白；去空白后
+  为空则直接命中（第 150-151 行），因此空字符串与纯空白单元格（如三个
+  ASCII 空格）都算命中。空白只在“比较时”去除，原值本身不被改写。
+* 只忽略 ASCII 字母大小写。第 152 行调用 ascii_lower()（第 134-138 行），
+  它只把 A-Z 这 26 个大写字母加 32，其他字符（含非 ASCII 字母与汉字）
+  原样保留。因此 "NULL"、"n/a" 与默认标记等值，而 "NULLABLE" 去空白后是
+  "nullable"，既不等于 null / n/a 也不等于自定义标记，不命中
+  （is_null_match() 的文档字符串第 147 行明确举例）。本例的自定义标记
+  “缺失”是汉字，不涉及大小写折叠，按原字符整值比较。
+* 替代文本原样写出，且不再次匹配。规则函数 normalize_null() 在
+  第 156-171 行：命中（第 169 行）就 `return replacement`，否则
+  `return value`（第 171 行）。替代值由主流程第 403-405 行绑定，
+  `args.null_replacement or ""` 表示省略时用空字符串；替代文本不 strip、
+  不折小写、也不会重新拿去和标记集合比对（函数文档字符串第 165-167 行，
+  模块说明第 21-27 行同义）。所以即使替代文本本身恰好拼作某个标记
+  （本例替代文本就是默认标记之一 N/A），写出 N/A 后也不会触发第二轮匹配。
+* 未命中原值保留。第 171 行原样返回 value；主循环只在清洗结果与原值
+  不等时才写回该列（第 470-477 行），因此未命中单元格连同两端空白
+  逐字节保留（本例记录 7 的 " NULLABLE " 导出后仍是 " NULLABLE "）。
+
+二、为什么 null_matches 与 changes 不总是同样多
+-----------------------------------------------
+
+两份明细在主循环（第 447-480 行）里按不同条件、针对原值分别记录：
+
+* null_matches 的追加条件在第 458-464 行：只要开启
+  --include-null-matches 且 is_null_match(original, extra_markers) 为真，
+  就记录一条 {"record", "column", "before"}，before 是 CSV 解析后的原值
+  （第 463 行；两端空白仍在，如 " NULL "）。它不看替代结果——即使替代后
+  文本与原值完全相同也照记。第 453-457 行的注释明确说明：空单元格配
+  默认空替代、或单元格拼写恰好等于 --null-replacement 时，命中但无变化。
+* changes 的追加条件在第 470-477 行：只有 cleaned != original 为真才
+  记录 {"record", "column", "before", "after"} 并令 changed_cells 加一
+  （第 478 行）。
+
+因此恒有“变化记录 ⊆ 命中记录”：每个发生变化的单元格必先命中，但命中
+未必带来变化。本例差异就在记录 6：原值 N/A 命中默认标记 n/a（ASCII
+大小写不敏感），而替代文本原样就是 N/A，cleaned 与 original 相等，于是
+它进 null_matches（第 6 条）却不进 changes。另一类典型差异是默认空
+替代下的空字符串/纯空白单元格：命中，但替代结果仍是空串，不计变化。
+
+记录序号口径：read_records()（第 337-357 行）在第 349 行对 csv.reader
+的记录从 1 开始 enumerate，表头是记录 1，数据记录依次为 2、3、……；
+带引号字段内的真实换行由 CSV 解析器吸收，不推进序号（函数文档字符串
+第 340-343 行）。两份明细共用这一序号，before 均保留解析后的原文。
+
+三、样例输入 nulls.csv
+----------------------
+
+在空目录中把以下内容原样保存为 UTF-8 编码的 nulls.csv（第一行表头；
+记录 2 的备注引号内有一个真实换行；各行以 LF 结束，最后一行后也有一个
+换行；state 列六条依次为空字符串、三个 ASCII 空格、两端各一个空格的
+NULL、缺失、N/A、两端各一个空格的 NULLABLE）：
+
+    state,note
+    ,"line one
+    line two"
+    "   ",ok
+    " NULL ",ok
+    缺失,ok
+    N/A,ok
+    " NULLABLE ",ok
+
+逐行对应（记录序号含表头）：
+
+* 记录 2：state 为空字符串（命中空值，备注含真实换行，仍只占记录 2）。
+* 记录 3：state 为三个 ASCII 空格（strip 后为空，命中）。
+* 记录 4：state 为 " NULL "（比较前去两端空白并折小写，命中 null）。
+* 记录 5：state 为“缺失”（命中自定义标记）。
+* 记录 6：state 为 N/A（命中默认标记 n/a；但替代文本也是 N/A，无变化）。
+* 记录 7：state 为 " NULLABLE "（整值不等于任何标记，不命中，原样保留）。
+
+四、预览（--dry-run，指向缺失父目录下的新文件）
+------------------------------------------------
+
+约定输出父目录 missing/ 不存在。执行：
+
+    python csv_cleaner.py --input nulls.csv --output missing/preview.csv --column state --rule normalize-null --null-marker 缺失 --null-replacement N/A --include-null-matches --include-changes --dry-run
+
+结果：退出码 0，标准错误为空，标准输出只有一行 JSON 对象（json.dumps
+默认 ensure_ascii=true，汉字“缺失”在 JSON 文本中转写为纯 ASCII 的
+`\u7f3a\u5931`（反斜杠加四位十六进制）；用 JSON 解析器解析后该字符串即“缺失”）：
+
+    {"rows": 6, "changed_cells": 4, "null_matches": [{"record": 2, "column": "state", "before": ""}, {"record": 3, "column": "state", "before": "   "}, {"record": 4, "column": "state", "before": " NULL "}, {"record": 5, "column": "state", "before": "\u7f3a\u5931"}, {"record": 6, "column": "state", "before": "N/A"}], "changes": [{"record": 2, "column": "state", "before": "", "after": "N/A"}, {"record": 3, "column": "state", "before": "   ", "after": "N/A"}, {"record": 4, "column": "state", "before": " NULL ", "after": "N/A"}, {"record": 5, "column": "state", "before": "\u7f3a\u5931", "after": "N/A"}]}
+
+要点：
+
+* rows 为 6（不含表头的数据行数），changed_cells 为 4。
+* null_matches 为记录 2 至 6 共 5 条，按记录顺序排列；before 保留解析后
+  原文：""、"   "、" NULL "、"缺失"、"N/A"。
+* changes 为记录 2 至 5 共 4 条，after 均为 "N/A"。记录 6 命中但替代后
+  仍是 N/A，不构成变化；记录 7 未命中，两份明细都不收录。
+* 字段内换行不增加序号：含两行备注的记录仍是记录 2。
+* --dry-run 的参数定义在第 330-333 行；第 482 行
+  `if not args.dry_run:` 之内的写出整块被跳过，预览不创建 preview.csv，
+  也不创建缺失的 missing/ 目录，nulls.csv 字节不变。预览只做路径形参
+  检查（输出不得与输入同路径、输出不得已存在，第 423-426 行），不验证
+  父目录是否存在或可写。
+
+五、导出（已有目录中的另一个新文件）
+------------------------------------
+
+去掉 --dry-run，输出到已存在目录 outdir 中的新文件 exported.csv：
+
+    python csv_cleaner.py --input nulls.csv --output outdir/exported.csv --column state --rule normalize-null --null-marker 缺失 --null-replacement N/A --include-null-matches --include-changes
+
+结果：退出码 0，标准错误为空，标准输出与第四节预览的 JSON 完全相同
+（同样是 rows 6、changed_cells 4、null_matches 记录 2-6、changes
+记录 2-5）。
+
+导出的 outdir/exported.csv 按 CSV 解析后为下表（左列 state，右列 note；
+记录 2 的备注仍是含一个 LF 换行的两行文本）：
+
+    state,note
+    N/A,"line one
+    line two"
+    N/A,ok
+    N/A,ok
+    N/A,ok
+    N/A,ok
+     NULLABLE ,ok
+
+字节层面的确定信息（可用 xxd 复核）：
+
+* 文件为 UTF-8、无 BOM：前三字节即 73 74 61（"sta"），没有 EF BB BF 开头。
+  写出在第 484 行以 open(..., "x", encoding="utf-8", newline="") 完成，
+  "x" 模式保证只建新文件、不覆盖；读取侧第 346 行用 utf-8-sig 打开，
+  可容忍输入 BOM，但写出侧不加 BOM。
+* 每条记录的行结束符为 CRLF（0d 0a），这是 csv.writer 的默认行结束符；
+  备注字段内部那条真实换行保持单个 LF（0a），且该字段整体带双引号。
+  记录 7 的 state 是未加引号的 " NULLABLE "（csv 不会为纯空白加引号），
+  两端空格逐字节保留；note 列全部保持 ok / 原文不变。
+* 表头、记录顺序、备注内容与输入一致；变化仅限 state 列记录 2-5 改为
+  N/A。输入 nulls.csv 以只读方式打开（第 346 行），其字节保持不变。
+
+六、两个明细开关相互独立，且不影响导出
+--------------------------------------
+
+开关定义：--include-changes 在第 319-322 行，--include-null-matches 在
+第 323-329 行。摘要在第 496-501 行组装：rows、changed_cells 两个键始终
+存在；仅当 --include-null-matches 时加入 null_matches 键（第 497-498
+行），仅当 --include-changes 时加入 changes 键（第 499-500 行）。省略
+哪个开关，JSON 中就完全不出现对应键；两个开关可单独使用，也可组合使用：
+
+* 两个都不加：{"rows": 6, "changed_cells": 4}
+* 只加 --include-null-matches：再含 null_matches 五条，不含 changes。
+* 只加 --include-changes：再含 changes 四条，不含 null_matches。
+* 两个都加：即第四、五节的完整 JSON。
+
+开关只影响标准输出的摘要内容，不影响导出文件：清洗结果在主循环中早已
+确定（第 466-479 行），写出只依据 out_rows（第 485-486 行）。三种开关
+组合各自导出的 CSV 字节完全相同（可用 md5sum 对比验证）。
+
+仅含表头的文件（内容只有 `state,note` 一行）同样合法。用同样参数预览：
+
+    python csv_cleaner.py --input header_only.csv --output missing/h.csv --column state --rule normalize-null --null-marker 缺失 --null-replacement N/A --include-null-matches --include-changes --dry-run
+
+退出码 0，标准错误为空，标准输出：
+
+    {"rows": 0, "changed_cells": 0, "null_matches": [], "changes": []}
+
+没有数据行，故计数为零，开启的两个明细数组均为空，missing/ 仍不被创建。
+去掉 --dry-run 导出时摘要相同，导出文件只含表头一行（同样无 BOM、
+CRLF 行结束）。
+
+七、三类错误：预览与导出都退出 2
+--------------------------------
+
+以下三种情况在读取输入之前（或写出之前）即被拒绝，预览与导出行为一致：
+退出码 2，标准输出为空，标准错误报告对应原因，不创建输出，已存在文件
+内容不变。统一出口是 fail()（第 259-261 行，打印 `error: ...` 到 stderr
+后 sys.exit(2)）。
+
+1) --include-null-matches 配合其他规则。该校验在第 409-411 行，早于
+   输入读取与 --dry-run 判断，因此 trim 等规则下无论是否预览都被拒绝：
+
+       python csv_cleaner.py --input nulls.csv --output missing/p.csv --column state --rule trim --include-null-matches --dry-run
+       python csv_cleaner.py --input nulls.csv --output outdir/a.csv --column state --rule trim --include-null-matches
+
+   两次均：退出码 2，标准输出为空，标准错误：
+
+       error: --include-null-matches can only be used with --rule normalize-null
+
+   不创建任何文件或目录；真实导出模式下 outdir/a.csv 也不会出现。
+
+2) 输出文件已存在。第 425-426 行在处理前用 os.path.exists 检查，--dry-run
+   不豁免。先让 outdir/existing.csv 带有内容 KEEP ME，再分别预览与导出：
+
+       python csv_cleaner.py --input nulls.csv --output outdir/existing.csv --column state --rule normalize-null --include-null-matches --dry-run
+       python csv_cleaner.py --input nulls.csv --output outdir/existing.csv --column state --rule normalize-null --include-null-matches
+
+   两次均：退出码 2，标准输出为空，标准错误：
+
+       error: output file already exists: 'outdir/existing.csv'
+
+   existing.csv 内容保持 KEEP ME 不变（第 484 行的 "x" 打开模式与
+   第 487-488 行对 FileExistsError 的处理是第二重保障）。
+
+3) 输出与输入同路径。第 423-424 行比较两条路径的 abspath，--dry-run
+   同样不豁免：
+
+       python csv_cleaner.py --input nulls.csv --output nulls.csv --column state --rule normalize-null --include-null-matches --dry-run
+       python csv_cleaner.py --input nulls.csv --output ./nulls.csv --column state --rule normalize-null --include-null-matches
+
+   两次均：退出码 2，标准输出为空，标准错误：
+
+       error: output path must be different from the input path
+
+   nulls.csv 字节保持不变。
+
+八、验收建议
+------------
+
+* 将第三节文本按所述换行与引号保存为 UTF-8 的 nulls.csv，运行第四节
+  预览命令：退出码 0、stderr 为空、stdout 与所给 JSON 逐字节一致，
+  missing/ 不出现；再运行第五节导出命令，用 CSV 解析器（Python csv、
+  newline="" 打开）核对导出文件为表头加六条记录，state 列依次为
+  N/A、N/A、N/A、N/A、N/A、" NULLABLE "，第一条备注解析为
+  "line one\nline two"，其余备注为 ok，并确认文件无 BOM、输入字节不变。
+* 明细口径可直接对照源码：命中判定 is_null_match()（第 141-153 行）、
+  ASCII 折叠 ascii_lower()（第 134-138 行）、默认标记第 106 行、
+  替代与未命中返回 normalize_null()（第 156-171 行）、命中记录
+  第 458-464 行、变化判定与计数第 470-478 行、明细键组装
+  第 496-501 行、序号规则 read_records() 第 337-357 行。
