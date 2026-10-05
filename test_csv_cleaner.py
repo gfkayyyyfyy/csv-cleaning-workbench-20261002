@@ -5910,5 +5910,314 @@ class NullReplacementDelimiterConversionTests(unittest.TestCase):
                 )
 
 
+class IncludeNullMatchesCliTests(unittest.TestCase):
+    """Coverage for the normalize-null --include-null-matches switch.
+
+    The switch reports every cell the null rule matches, including a
+    match whose replacement leaves the cell text identical -- exactly
+    the case the plain change count and the --include-changes detail
+    omit. The sample is a comma CSV headed state,note with five data
+    records: an empty cell, a padded NULL, the custom marker "missing"
+    spelled exactly like the replacement, an N/A and the near-miss
+    "NULLABLE"; the first note carries a real newline inside CSV quotes
+    so CSV record numbers (the header counts as record 1) must not
+    follow physical lines. Running normalize-null with --null-marker
+    MISSING and --null-replacement missing matches records 2-5 but
+    changes only records 2, 3 and 5. Each test gets a private temporary
+    directory and compares parsed JSON, so object key order is
+    irrelevant; only the standard library and the public CLI are used.
+    """
+
+    STATE_HEADER = ["state", "note"]
+    # The first note holds a quoted real newline plus embedded double
+    # quotes; every other note is plain text outside the cleaned column.
+    MULTILINE_NOTE_VALUE = 'he said "hi, all"\nline two'
+    STATE_NULL_ROWS = [
+        STATE_HEADER,
+        ["", MULTILINE_NOTE_VALUE],   # record 2: empty -> missing
+        [" NULL ", "ok"],             # record 3: padded NULL -> missing
+        ["missing", "ok"],            # record 4: marker == replacement
+        ["N/A", "ok"],                # record 5: N/A -> missing
+        ["NULLABLE", "ok"],           # record 6: near miss, kept verbatim
+    ]
+    # The first four states become "missing"; NULLABLE survives as-is.
+    EXPECTED_STATES = [
+        "missing", "missing", "missing", "missing", "NULLABLE",
+    ]
+    # All four marker hits, in record order; record 4's before keeps the
+    # parsed original text and is listed even though it does not change.
+    EXPECTED_NULL_MATCHES = [
+        {"record": 2, "column": "state", "before": ""},
+        {"record": 3, "column": "state", "before": " NULL "},
+        {"record": 4, "column": "state", "before": "missing"},
+        {"record": 5, "column": "state", "before": "N/A"},
+    ]
+    # Only the cells whose text actually differs from the replacement.
+    EXPECTED_CHANGES = [
+        {"record": 2, "column": "state", "before": "",
+         "after": "missing"},
+        {"record": 3, "column": "state", "before": " NULL ",
+         "after": "missing"},
+        {"record": 5, "column": "state", "before": "N/A",
+         "after": "missing"},
+    ]
+    EXPECTED_SUMMARY = {
+        "rows": 5,
+        "changed_cells": 3,
+        "null_matches": EXPECTED_NULL_MATCHES,
+        "changes": EXPECTED_CHANGES,
+    }
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, tag):
+        data = encode_csv(rows, bom=False)
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(data)
+        return path, data
+
+    def run_cleaner(self, input_path, output_path, *, dry_run=False,
+                    include_null_matches=False, include_changes=False,
+                    rule="normalize-null", column="state",
+                    markers=("MISSING",), replacement="missing"):
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", column,
+            "--rule", rule,
+        ]
+        for marker in markers:
+            argv.extend(["--null-marker", marker])
+        if replacement is not None:
+            argv.extend(["--null-replacement", replacement])
+        if include_null_matches:
+            argv.append("--include-null-matches")
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def assert_workspace_holds_only(self, names):
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()), sorted(names)
+        )
+
+    def test_preview_and_export_share_summary_and_distinguish_match(self):
+        # A --dry-run preview targets a file inside a missing directory,
+        # then the same input is really exported to a second,
+        # not-yet-existing file. Both runs exit 0 with empty stderr and
+        # the same parsed JSON: five rows, three changed cells, four
+        # null matches (records 2-5, entries with exactly
+        # record/column/before) and three changes (records 2, 3, 5,
+        # after "missing"). Record 4 matches but does not change.
+        input_path, original_bytes = self.write_input(
+            self.STATE_NULL_ROWS, tag="null_matches"
+        )
+        missing_dir = self.tmpdir / "nodir"
+        preview_path = missing_dir / "preview.csv"
+        export_path = self.tmpdir / "cleaned.csv"
+        self.assertFalse(missing_dir.exists())
+        self.assertFalse(preview_path.exists())
+        self.assertFalse(export_path.exists())
+
+        preview = self.run_cleaner(
+            input_path, preview_path, dry_run=True,
+            include_null_matches=True, include_changes=True,
+        )
+
+        self.assertEqual(preview.returncode, 0)
+        self.assertEqual(preview.stderr, b"")
+        # stdout must be exactly one JSON object; json.loads rejects any
+        # trailing non-whitespace. Dict equality also pins each entry's
+        # key set, and comparison is by parsed content so JSON key order
+        # is irrelevant.
+        preview_summary = json.loads(preview.stdout.decode("utf-8"))
+        self.assertEqual(preview_summary, self.EXPECTED_SUMMARY)
+        # The preview creates neither the file nor its missing parent,
+        # and the input keeps its exact bytes.
+        self.assertFalse(preview_path.exists())
+        self.assertFalse(missing_dir.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+        export = self.run_cleaner(
+            input_path, export_path, dry_run=False,
+            include_null_matches=True, include_changes=True,
+        )
+
+        self.assertEqual(export.returncode, 0)
+        self.assertEqual(export.stderr, b"")
+        export_summary = json.loads(export.stdout.decode("utf-8"))
+        # Preview and export print the same summary content.
+        self.assertEqual(export_summary, preview_summary)
+        self.assertEqual(export_summary, self.EXPECTED_SUMMARY)
+
+        self.assertTrue(export_path.exists())
+        self.assertFalse(
+            export_path.read_bytes().startswith(codecs.BOM_UTF8)
+        )
+        output_rows = self.read_output_records(export_path)
+        # Header, record count and record order are unchanged.
+        self.assertEqual(output_rows[0], self.STATE_HEADER)
+        self.assertEqual(len(output_rows), 6)
+        # The first four states are now "missing"; NULLABLE survives.
+        self.assertEqual(
+            [row[0] for row in output_rows[1:]], self.EXPECTED_STATES
+        )
+        # The note column is never cleaned: the quoted real newline, the
+        # embedded double quotes and every plain note round-trip as
+        # parsed values, and the embedded newline adds no CSV record.
+        self.assertEqual(
+            [row[1] for row in output_rows],
+            [row[1] for row in self.STATE_NULL_ROWS],
+        )
+        self.assertEqual(output_rows[1][1], self.MULTILINE_NOTE_VALUE)
+        # Both runs leave the input bytes untouched.
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+        self.assert_workspace_holds_only(
+            [input_path.name, export_path.name]
+        )
+
+    def test_summary_without_switch_has_no_null_matches_key(self):
+        # Omitting --include-null-matches keeps the exact two-key
+        # summary; null_matches is absent (and so is changes, since
+        # --include-changes is omitted too).
+        input_path, original_bytes = self.write_input(
+            self.STATE_NULL_ROWS, tag="null_matches_off"
+        )
+        output_path = self.tmpdir / "cleaned_off.csv"
+
+        result = self.run_cleaner(input_path, output_path)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        summary = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(summary, {"rows": 5, "changed_cells": 3})
+        self.assertNotIn("null_matches", summary)
+        self.assertNotIn("changes", summary)
+        self.assertTrue(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_null_matches_only_omits_changes_but_keeps_result(self):
+        # With only --include-null-matches the summary gains
+        # null_matches but no changes key; the counts and the exported
+        # bytes are exactly what both switches together produce.
+        input_path, original_bytes = self.write_input(
+            self.STATE_NULL_ROWS, tag="null_matches_only"
+        )
+        only_path = self.tmpdir / "cleaned_only.csv"
+        both_path = self.tmpdir / "cleaned_both.csv"
+
+        only = self.run_cleaner(
+            input_path, only_path, include_null_matches=True
+        )
+        both = self.run_cleaner(
+            input_path, both_path, include_null_matches=True,
+            include_changes=True,
+        )
+
+        self.assertEqual(only.returncode, 0)
+        self.assertEqual(only.stderr, b"")
+        only_summary = json.loads(only.stdout.decode("utf-8"))
+        self.assertEqual(
+            only_summary,
+            {"rows": 5, "changed_cells": 3,
+             "null_matches": self.EXPECTED_NULL_MATCHES},
+        )
+        self.assertNotIn("changes", only_summary)
+
+        self.assertEqual(both.returncode, 0)
+        self.assertEqual(both.stderr, b"")
+        both_summary = json.loads(both.stdout.decode("utf-8"))
+        self.assertEqual(
+            (only_summary["rows"], only_summary["changed_cells"]),
+            (both_summary["rows"], both_summary["changed_cells"]),
+        )
+        self.assertEqual(
+            only_summary["null_matches"], both_summary["null_matches"]
+        )
+        # Detail switches never affect the export: identical bytes.
+        self.assertEqual(only_path.read_bytes(), both_path.read_bytes())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+
+    def test_header_only_both_details_report_empty_arrays(self):
+        # A header-only input with both detail switches still succeeds:
+        # both counts are 0 and both arrays are present and empty. The
+        # preview creates nothing; the real export rewrites just the
+        # header.
+        input_path, original_bytes = self.write_input(
+            [self.STATE_HEADER], tag="null_matches_header_only"
+        )
+
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                tag = "dry" if dry_run else "out"
+                output_path = self.tmpdir / f"cleaned_header_{tag}.csv"
+
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=dry_run,
+                    include_null_matches=True, include_changes=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 0, "changed_cells": 0,
+                     "null_matches": [], "changes": []},
+                )
+                if dry_run:
+                    self.assertFalse(output_path.exists())
+                else:
+                    self.assertTrue(output_path.exists())
+                    self.assertEqual(
+                        self.read_output_records(output_path),
+                        [self.STATE_HEADER],
+                    )
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_switch_with_trim_is_rejected_even_on_header_only(self):
+        # --include-null-matches belongs to normalize-null alone; with
+        # trim it is rejected before the input is read, so even a
+        # header-only file fails: exit 2, empty stdout, the reason on
+        # stderr, no output file and untouched input bytes.
+        input_path, original_bytes = self.write_input(
+            [self.STATE_HEADER], tag="null_matches_trim"
+        )
+        output_path = self.tmpdir / "cleaned_trim.csv"
+        self.assertFalse(output_path.exists())
+
+        result = self.run_cleaner(
+            input_path, output_path, rule="trim",
+            markers=(), replacement=None, include_null_matches=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(
+            result.stderr.decode("utf-8"),
+            "error: --include-null-matches can only be used with "
+            "--rule normalize-null\n",
+        )
+        self.assertNotIn("Traceback", result.stderr.decode("utf-8"))
+        self.assertFalse(output_path.exists())
+        self.assertEqual(input_path.read_bytes(), original_bytes)
+        self.assert_workspace_holds_only([input_path.name])
+
+
 if __name__ == "__main__":
     unittest.main()
