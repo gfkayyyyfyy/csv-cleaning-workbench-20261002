@@ -33,6 +33,31 @@ The tests exercise only the documented public CLI:
   0001/01/01 slash spelling), 2000-02-29 is a century leap day in
   either spelling, and 1900-02-29, 29/02/2100, 0000-01-01 and
   01/01/10000 are each rejected at record 3 without partial output.
+* normalize-date compact eight-digit YYYYMMDD spelling: the due_date,note
+  acceptance sample has five data records whose due_date values parse as
+  " 20240229 " (one plain space on each end), 00010101, 99991231,
+  2024-03-01 and an empty string, while the first note carries a double
+  quote and a quoted real newline. The export exits 0 with empty stderr
+  and one JSON object (rows 5 / changed_cells 3) and writes
+  2024-02-29 / 0001-01-01 / 9999-12-31 / 2024-03-01 / "", both with and
+  without a UTF-8 BOM on input and always as BOM-free UTF-8, with the
+  header, record order, notes and input bytes unchanged. With
+  --include-changes only records 2, 3 and 4 are listed, all on column
+  due_date, before keeping the parsed original text and after holding
+  the ISO result; omitting --date-order, explicit dmy and explicit mdy
+  give identical results. The --dry-run preview prints JSON equal in
+  parsed content to the real export's and, with its output below a
+  nonexistent parent directory, creates neither the file nor the
+  directory. Each of 20230229 (not a leap day), 00000101 (year 0000),
+  2024022 (seven digits), 202402290 (nine digits), ２０２４０２２９
+  (fullwidth digits), 2024 0229 (internal whitespace) and
+  20240229T00:00 (a time suffix) is placed at record 3 after one
+  cleanable record whose note carries a quoted real newline and before a
+  second invalid value, 20241301; both preview and export exit 2 with
+  empty stdout and a stderr naming invalid date, due_date, record 3 and
+  the first offending value, never the later record or a Python
+  traceback, and no output file is created while the input bytes stay
+  unchanged.
 * normalize-date --date-order: the optional --date-order takes only the
   lowercase choices dmy and mdy and defaults to dmy when omitted, so the
   existing DD/MM/YYYY reading is unchanged. Under mdy a slash date with
@@ -6419,6 +6444,416 @@ class DefaultReplacementNullMatchesTests(unittest.TestCase):
                 self.assertNotIn("Traceback", stderr_text)
                 self.assertFalse(output_path.exists())
                 self.assertEqual(input_path.read_bytes(), original_bytes)
+
+
+class CompactDateCliTests(unittest.TestCase):
+    """CLI regression for the compact eight-digit YYYYMMDD spelling.
+
+    Everything goes through the documented public entry point against
+    small CSV files in a private temporary directory, using only the
+    standard library. Outcomes are judged on parsed CSV fields and the
+    parsed JSON object, so CSV quoting style and JSON key order are
+    irrelevant.
+    """
+
+    # due_date,note header plus five data records. The first compact
+    # value is padded with one plain space on each end; the next two hit
+    # the documented year endpoints 0001 and 9999; the fourth is already
+    # ISO (so it must not count as a change); the fifth is an empty
+    # cell. The first note embeds a double quote and a real newline,
+    # which is quoted in the CSV and must not disturb record numbering
+    # (the header is record 1, so these are records 2-6).
+    COMPACT_DATE_ROWS = [
+        DATE_HEADER,
+        [" 20240229 ", 'he said "yes"\nnext line'],  # leap day, padded
+        ["00010101", "year 0001 endpoint"],
+        ["99991231", "year 9999 endpoint"],
+        ["2024-03-01", "already ISO"],
+        ["", "already empty"],
+    ]
+    COMPACT_EXPECTED_DATES = [
+        "2024-02-29",
+        "0001-01-01",
+        "9999-12-31",
+        "2024-03-01",
+        "",
+    ]
+    # Records 2, 3 and 4 change; record 5 is already ISO and record 6 is
+    # already empty.
+    COMPACT_EXPECTED_CHANGES = [
+        {"record": 2, "column": "due_date",
+         "before": " 20240229 ", "after": "2024-02-29"},
+        {"record": 3, "column": "due_date",
+         "before": "00010101", "after": "0001-01-01"},
+        {"record": 4, "column": "due_date",
+         "before": "99991231", "after": "9999-12-31"},
+    ]
+
+    # Compact spellings that must all be rejected. Each failure run puts
+    # one cleanable record first (its note holds a real quoted newline),
+    # the candidate value at record 3, and a second invalid compact
+    # value 20241301 (month 13) at record 4, which must never be
+    # reported because the run aborts at the first failure.
+    COMPACT_INVALID_VALUES = [
+        ("20230229", "2023 is not a leap year"),
+        ("00000101", "year 0000 is outside 0001-9999"),
+        ("2024022", "only seven digits"),
+        ("202402290", "nine digits, not exactly eight"),
+        ("２０２４０２２９", "fullwidth digits are not ASCII digits"),
+        ("2024 0229", "internal whitespace breaks the spelling"),
+        ("20240229T00:00", "a time suffix is not part of the spelling"),
+    ]
+
+    def setUp(self):
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.tmpdir = Path(self._tempdir.name)
+
+    def write_input(self, rows, *, bom, tag):
+        path = self.tmpdir / f"input_{tag}.csv"
+        path.write_bytes(encode_csv(rows, bom=bom))
+        return path, path.read_bytes()
+
+    def run_cleaner(self, input_path, output_path, *, order="OMITTED",
+                    include_changes=False, dry_run=False):
+        # order="OMITTED" means --date-order is not passed at all.
+        argv = [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--column", "due_date",
+            "--rule", "normalize-date",
+        ]
+        if order != "OMITTED":
+            argv.extend(["--date-order", order])
+        if include_changes:
+            argv.append("--include-changes")
+        if dry_run:
+            argv.append("--dry-run")
+        return subprocess.run(
+            argv, cwd=str(self.tmpdir), capture_output=True
+        )
+
+    def read_output_records(self, path):
+        # Plain utf-8 (not utf-8-sig) so a stray BOM would surface as
+        # content.
+        with open(path, "r", encoding="utf-8", newline="") as outfile:
+            return list(csv.reader(outfile))
+
+    def assert_workspace_holds_only(self, names):
+        self.assertEqual(
+            sorted(p.name for p in self.tmpdir.iterdir()), sorted(names)
+        )
+
+    def test_compact_dates_normalize_with_and_without_bom(self):
+        # Inputs with and without a UTF-8 BOM both exit 0 with empty
+        # stderr and one JSON object: rows counts the five data records
+        # and changed_cells the three compact conversions (the already
+        # ISO and already empty cells do not change). The export is
+        # BOM-free UTF-8 and keeps the header, record order and every
+        # parsed note value, and the input bytes stay untouched.
+        for bom in (False, True):
+            with self.subTest(bom=bom):
+                tag = "compact_bom" if bom else "compact_nobom"
+                input_path, original_bytes = self.write_input(
+                    self.COMPACT_DATE_ROWS, bom=bom, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+                self.assertFalse(output_path.exists())
+
+                result = self.run_cleaner(input_path, output_path)
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                # stdout must consist of exactly one JSON object and
+                # nothing else; json.loads rejects trailing
+                # non-whitespace.
+                self.assertEqual(
+                    json.loads(result.stdout.decode("utf-8")),
+                    {"rows": 5, "changed_cells": 3},
+                )
+
+                self.assertTrue(output_path.exists())
+                raw_output = output_path.read_bytes()
+                self.assertFalse(raw_output.startswith(codecs.BOM_UTF8))
+                # Decoded as plain UTF-8 a BOM would surface; also
+                # confirm the bytes round-trip through the UTF-8 codec.
+                raw_output.decode("utf-8")
+
+                output_rows = self.read_output_records(output_path)
+                self.assertEqual(output_rows[0], DATE_HEADER)
+                self.assertEqual(len(output_rows), 6)
+                self.assertEqual(
+                    [row[0] for row in output_rows[1:]],
+                    self.COMPACT_EXPECTED_DATES,
+                )
+                # The note column is never cleaned: the double quote,
+                # embedded real newline and plain text all round-trip in
+                # terms of parsed field values.
+                self.assertEqual(
+                    [row[1] for row in output_rows],
+                    [row[1] for row in self.COMPACT_DATE_ROWS],
+                )
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_compact_dates_changes_detail_under_every_date_order(self):
+        # With --include-changes only records 2, 3 and 4 are listed in
+        # record order, every entry naming due_date, before keeping the
+        # parsed original and after holding the ISO result. Omitting
+        # --date-order, explicit dmy and explicit mdy all give the same
+        # result because the compact spelling is always year-month-day.
+        for order in ("OMITTED", "dmy", "mdy"):
+            with self.subTest(order=order):
+                tag = f"compact_changes_{order}"
+                input_path, original_bytes = self.write_input(
+                    self.COMPACT_DATE_ROWS, bom=False, tag=tag
+                )
+                output_path = self.tmpdir / f"cleaned_{tag}.csv"
+
+                result = self.run_cleaner(
+                    input_path, output_path, order=order,
+                    include_changes=True,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(summary["rows"], 5)
+                self.assertEqual(summary["changed_cells"], 3)
+                self.assertEqual(
+                    summary["changes"], self.COMPACT_EXPECTED_CHANGES
+                )
+                # One detail entry per changed cell, nothing more.
+                self.assertEqual(
+                    len(summary["changes"]),
+                    summary["changed_cells"],
+                )
+                self.assertEqual(
+                    [entry["record"] for entry in summary["changes"]],
+                    [2, 3, 4],
+                )
+                self.assertTrue(
+                    all(
+                        entry["column"] == "due_date"
+                        for entry in summary["changes"]
+                    )
+                )
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_compact_dates_without_changes_key_under_every_date_order(self):
+        # Without the switch none of the three order spellings adds a
+        # changes key, and the counts are identical.
+        for order in ("OMITTED", "dmy", "mdy"):
+            with self.subTest(order=order):
+                input_path, _ = self.write_input(
+                    self.COMPACT_DATE_ROWS, bom=False,
+                    tag=f"compact_nochanges_{order}",
+                )
+                output_path = self.tmpdir / (
+                    f"cleaned_nochanges_{order}.csv"
+                )
+
+                result = self.run_cleaner(
+                    input_path, output_path, order=order
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(
+                    summary, {"rows": 5, "changed_cells": 3}
+                )
+                self.assertNotIn("changes", summary)
+
+    def test_compact_dates_preview_json_equals_export_json(self):
+        # For the same input and switches the --dry-run preview and the
+        # real export print JSON equal in parsed content, with and
+        # without --include-changes.
+        input_path, original_bytes = self.write_input(
+            self.COMPACT_DATE_ROWS, bom=False, tag="compact_preview_eq"
+        )
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                tag = "with" if include_changes else "without"
+                preview_path = self.tmpdir / (
+                    f"cleaned_preview_{tag}.csv"
+                )
+                export_path = self.tmpdir / (
+                    f"cleaned_export_{tag}.csv"
+                )
+
+                preview = self.run_cleaner(
+                    input_path, preview_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+                export = self.run_cleaner(
+                    input_path, export_path, dry_run=False,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(preview.returncode, 0)
+                self.assertEqual(preview.stderr, b"")
+                self.assertEqual(export.returncode, 0)
+                self.assertEqual(export.stderr, b"")
+                # Compared by parsed content, not key order or bytes.
+                self.assertEqual(
+                    json.loads(preview.stdout.decode("utf-8")),
+                    json.loads(export.stdout.decode("utf-8")),
+                )
+                self.assertFalse(preview_path.exists())
+                self.assertTrue(export_path.exists())
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+    def test_compact_dates_preview_creates_nothing_below_missing_parent(
+        self,
+    ):
+        # The preview output names a free file inside a directory that
+        # does not exist; the preview must still succeed (the write is
+        # skipped) and create neither the file nor the missing
+        # directory, with and without --include-changes.
+        input_path, original_bytes = self.write_input(
+            self.COMPACT_DATE_ROWS, bom=False,
+            tag="compact_preview_missing_dir",
+        )
+        missing_dir = self.tmpdir / "nodir_compact"
+        output_path = missing_dir / "cleaned.csv"
+        self.assertFalse(missing_dir.exists())
+        self.assertFalse(output_path.exists())
+
+        for include_changes in (False, True):
+            with self.subTest(include_changes=include_changes):
+                result = self.run_cleaner(
+                    input_path, output_path, dry_run=True,
+                    include_changes=include_changes,
+                )
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, b"")
+                summary = json.loads(result.stdout.decode("utf-8"))
+                self.assertEqual(summary["rows"], 5)
+                self.assertEqual(summary["changed_cells"], 3)
+                if include_changes:
+                    self.assertEqual(
+                        summary["changes"],
+                        self.COMPACT_EXPECTED_CHANGES,
+                    )
+                else:
+                    self.assertNotIn("changes", summary)
+                self.assertFalse(output_path.exists())
+                self.assertFalse(missing_dir.exists())
+                self.assertEqual(
+                    input_path.read_bytes(), original_bytes
+                )
+
+        self.assert_workspace_holds_only([input_path.name])
+
+    def test_compact_invalid_dates_fail_preview_and_export(self):
+        # Each candidate compact value sits at record 3: record 2 is a
+        # cleanable compact leap day whose note carries a quoted real
+        # newline (it spans two physical lines but counts as one CSV
+        # record), and record 4 holds the second invalid value
+        # 20241301 which must never be reported. Both the preview and
+        # the real export exit 2 with stdout exactly empty and a stderr
+        # naming invalid date, the column due_date, record 3 and the
+        # first offending value verbatim -- but never record 4, the
+        # later value or a Python traceback. No output file is created
+        # and the input bytes stay unchanged.
+        for value, why in self.COMPACT_INVALID_VALUES:
+            with self.subTest(value=value, why=why):
+                rows = [
+                    DATE_HEADER,
+                    [" 20240229 ", 'first note\nstill first'],
+                    [value, "candidate"],
+                    ["20241301", "month 13, never reported"],
+                ]
+                tag = "compact_bad"
+                input_path, original_bytes = self.write_input(
+                    rows, bom=False, tag=tag
+                )
+
+                for dry_run in (False, True):
+                    with self.subTest(dry_run=dry_run):
+                        mode = "preview" if dry_run else "export"
+                        output_path = self.tmpdir / (
+                            f"cleaned_{tag}_{mode}.csv"
+                        )
+                        self.assertFalse(output_path.exists())
+
+                        result = self.run_cleaner(
+                            input_path, output_path, dry_run=dry_run
+                        )
+
+                        self.assertEqual(result.returncode, 2)
+                        self.assertEqual(result.stdout, b"")
+                        stderr_text = result.stderr.decode("utf-8")
+                        self.assertIn("invalid date", stderr_text)
+                        self.assertIn("due_date", stderr_text)
+                        self.assertIn("record 3", stderr_text)
+                        # The message quotes the first offending value
+                        # verbatim.
+                        self.assertIn(value, stderr_text)
+                        # Only the first invalid date is reported; the
+                        # later record must not appear.
+                        self.assertNotIn("record 4", stderr_text)
+                        self.assertNotIn("20241301", stderr_text)
+                        self.assertNotIn("Traceback", stderr_text)
+                        self.assertFalse(output_path.exists())
+                        self.assertEqual(
+                            input_path.read_bytes(), original_bytes
+                        )
+
+        # Neither export nor preview created anything next to the input.
+        self.assert_workspace_holds_only([input_path.name])
+
+    def test_compact_invalid_dates_fail_with_changes_switch(self):
+        # With --include-changes a failing run must still print nothing
+        # on stdout (no partial summary or changes detail); the same
+        # diagnostic applies under each --date-order spelling because
+        # the compact spelling is never reordered.
+        for value, _why in self.COMPACT_INVALID_VALUES:
+            with self.subTest(value=value):
+                rows = [
+                    DATE_HEADER,
+                    [" 20240229 ", 'first note\nstill first'],
+                    [value, "candidate"],
+                    ["20241301", "month 13, never reported"],
+                ]
+                input_path, original_bytes = self.write_input(
+                    rows, bom=False, tag="compact_bad_changes"
+                )
+                output_path = self.tmpdir / (
+                    "cleaned_compact_bad_changes.csv"
+                )
+
+                for order in ("OMITTED", "dmy", "mdy"):
+                    with self.subTest(order=order):
+                        result = self.run_cleaner(
+                            input_path, output_path, order=order,
+                            include_changes=True,
+                        )
+
+                        self.assertEqual(result.returncode, 2)
+                        self.assertEqual(result.stdout, b"")
+                        stderr_text = result.stderr.decode("utf-8")
+                        self.assertIn("invalid date", stderr_text)
+                        self.assertIn("due_date", stderr_text)
+                        self.assertIn("record 3", stderr_text)
+                        self.assertIn(value, stderr_text)
+                        self.assertNotIn("record 4", stderr_text)
+                        self.assertNotIn("20241301", stderr_text)
+                        self.assertNotIn("Traceback", stderr_text)
+                        self.assertFalse(output_path.exists())
+                        self.assertEqual(
+                            input_path.read_bytes(), original_bytes
+                        )
 
 
 if __name__ == "__main__":
