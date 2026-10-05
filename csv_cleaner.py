@@ -79,6 +79,13 @@ With --include-changes the same JSON object gains a "changes" array with
 one {"record", "column", "before", "after"} entry per changed cell, in
 record order; no separate detail file is written.
 
+With --include-null-matches (normalize-null only) the summary also gains
+a "null_matches" array with one {"record", "column", "before"} entry per
+cell the null rule matches, in record order, whether or not the
+replacement actually changes the cell text; the exported CSV is
+unaffected and no separate detail file is written. The two detail
+switches are independent and may be used together.
+
 With --dry-run the input is fully read and validated and the same summary
 JSON is printed, but no output file or directory is created. The output
 path must still differ from the input and must not already exist; a
@@ -131,6 +138,21 @@ def ascii_lower(text):
     )
 
 
+def is_null_match(value, extra_markers=frozenset()):
+    """Return True when the null rule would replace the cell.
+
+    After stripping both ends, the cell matches when the result is empty
+    or equals NULL / N/A (or any of the given extra markers)
+    case-insensitively with respect to ASCII letters. Anything else
+    (e.g. "NULLABLE") does not match.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return True
+    lowered = ascii_lower(stripped)
+    return lowered in NULL_MARKERS or lowered in extra_markers
+
+
 def normalize_null(value, extra_markers=frozenset(), replacement=""):
     """Normalize null markers to the replacement text (empty by default).
 
@@ -144,11 +166,7 @@ def normalize_null(value, extra_markers=frozenset(), replacement=""):
     is not stripped, not case-folded and never re-matched against the
     markers, and an empty or whitespace-only replacement is allowed.
     """
-    stripped = value.strip()
-    if not stripped:
-        return replacement
-    lowered = ascii_lower(stripped)
-    if lowered in NULL_MARKERS or lowered in extra_markers:
+    if is_null_match(value, extra_markers):
         return replacement
     return value
 
@@ -302,6 +320,13 @@ def parse_args(argv):
                         help="add a changes array to the success summary "
                              "with one {record, column, before, after} "
                              "entry per changed cell, in record order")
+    parser.add_argument("--include-null-matches", action="store_true",
+                        help="add a null_matches array to the success "
+                             "summary with one {record, column, before} "
+                             "entry per cell the normalize-null rule "
+                             "matches, in record order, whether or not "
+                             "the replacement changes the cell text; "
+                             "only valid with --rule normalize-null")
     parser.add_argument("--dry-run", action="store_true",
                         help="preview only: fully read and validate the "
                              "input and print the same summary JSON, but "
@@ -379,6 +404,12 @@ def main(argv=None):
         rule = partial(normalize_null, extra_markers=extra_markers,
                        replacement=args.null_replacement or "")
 
+    # --include-null-matches only reports on normalize-null matches; with
+    # any other rule it is rejected before the input is even read.
+    if args.include_null_matches and args.rule != "normalize-null":
+        fail("--include-null-matches can only be used with "
+             "--rule normalize-null")
+
     # --date-order only governs normalize-date. argparse already rejects
     # a missing value or anything other than the lowercase choices dmy /
     # mdy (exit 2); an explicit order paired with another rule is rejected
@@ -412,21 +443,35 @@ def main(argv=None):
     data_rows = 0
     changed_cells = 0
     changes = []
+    null_matches = []
     for record_no, record in records[1:]:
         if len(record) != expected_fields:
             fail(f"record {record_no} has {len(record)} field(s), "
                  f"expected {expected_fields}")
         record = list(record)
+        original = record[column_index]
+        # A null match is recorded against the original parsed text even
+        # when the replacement leaves the cell byte-for-byte identical
+        # (e.g. an empty cell with the default empty replacement, or a
+        # marker spelled exactly like --null-replacement); the
+        # replacement result itself is never re-matched.
+        if args.include_null_matches and is_null_match(original,
+                                                       extra_markers):
+            null_matches.append({
+                "record": record_no,
+                "column": args.column,
+                "before": original,
+            })
         try:
-            cleaned = rule(record[column_index])
+            cleaned = rule(original)
         except InvalidDateError:
             fail(f"invalid date in column {args.column!r} "
-                 f"at record {record_no}: {record[column_index]!r}")
-        if cleaned != record[column_index]:
+                 f"at record {record_no}: {original!r}")
+        if cleaned != original:
             changes.append({
                 "record": record_no,
                 "column": args.column,
-                "before": record[column_index],
+                "before": original,
                 "after": cleaned,
             })
             record[column_index] = cleaned
@@ -449,6 +494,8 @@ def main(argv=None):
             fail(f"cannot write output file {args.output!r}: {exc}")
 
     summary = {"rows": data_rows, "changed_cells": changed_cells}
+    if args.include_null_matches:
+        summary["null_matches"] = null_matches
     if args.include_changes:
         summary["changes"] = changes
     print(json.dumps(summary))
